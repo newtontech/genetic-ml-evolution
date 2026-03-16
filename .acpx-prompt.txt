@@ -1,0 +1,17 @@
+Fix GitHub Issue #13
+
+Repo: newtontech/genetic-ml-evolution
+Issue: [Quality] 代码复杂度
+
+Task: Analyze the codebase and improve code complexity.
+
+Steps:
+1. Analyze current code complexity (use radon or similar tools)
+2. Identify high-complexity functions
+3. Refactor the most complex function to reduce complexity
+4. Run any existing tests to ensure nothing breaks
+5. git add -A && git commit -m "refactor: improve code complexity (Fixes #13)"
+6. git push -u origin fix-issue-13-test-20260316111149
+7. gh pr create --title "refactor: improve code complexity" --body "Fixes #13"
+
+Report the PR URL when done.
