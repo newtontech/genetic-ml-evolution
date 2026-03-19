@@ -321,8 +321,13 @@ class TestArchitectureEncoding:
         features_avg = surrogate_model._encode_cnn(arch_avg)
         assert features_avg[11:14] == [0, 1, 0]
         
+        # adaptive (也是一个有效的池化类型)
+        arch_adaptive = {**base_arch, "pooling": "adaptive"}
+        features_adaptive = surrogate_model._encode_cnn(arch_adaptive)
+        assert features_adaptive[11:14] == [0, 0, 1]
+        
         # 不在列表中的池化类型（应该返回全零）
-        arch_other = {**base_arch, "pooling": "adaptive"}
+        arch_other = {**base_arch, "pooling": "global_avg"}
         features_other = surrogate_model._encode_cnn(arch_other)
         assert features_other[11:14] == [0, 0, 0]
     
