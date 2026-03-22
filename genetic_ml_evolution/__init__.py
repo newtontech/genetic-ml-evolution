@@ -9,5 +9,6 @@ __author__ = "Newton Tech"
 
 from .cache_system import ArchitectureCache
 from .surrogate_model import SurrogateModel
+from .genetic_algorithm import GeneticAlgorithm, Individual, MutationStrategy
 
-__all__ = ["ArchitectureCache", "SurrogateModel"]
+__all__ = ["ArchitectureCache", "SurrogateModel", "GeneticAlgorithm", "Individual", "MutationStrategy"]
