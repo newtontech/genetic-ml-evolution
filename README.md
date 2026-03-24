@@ -27,6 +27,14 @@
 - 🎯 **多目标优化**：精度 + 速度 + 显存
 - 🔄 **自适应策略**：动态调整进化参数
 
+### 3. 高级变异策略（NEW! 🎉）
+- 🎯 **智能自适应变异率**：基于个体适应度、年龄、种群多样性和世代数动态调整
+- 📊 **分层变异策略**：探索期（0-20代）→ 平衡期（20-60代）→ 利用期（60+代）
+- 🎰 **UCB操作选择**：使用Upper Confidence Bound算法选择最优变异操作
+- 💡 **Token限制优化**：考虑小规模语言模型的token限制和生成质量
+- 📈 **参数预算控制**：限制模型参数数量，防止过大的模型
+- 🔍 **成功率追踪**：记录每种变异操作的成功率，优化未来选择
+
 ## 📦 安装
 
 ```bash
@@ -42,6 +50,8 @@ pip install arxiv arxiv-dl scholarly semanticscholar
 ```
 
 ## 🔧 快速开始
+
+### 基础使用
 
 ```python
 from genetic_ml_evolution import EvolutionEngine
@@ -60,6 +70,67 @@ best_model = engine.evolve()
 print(f"最佳模型: {best_model.architecture}")
 print(f"验证精度: {best_model.accuracy:.2%}")
 ```
+
+### 高级变异策略（NEW! 🎉）
+
+```python
+from genetic_ml_evolution import AdvancedMutationStrategy
+
+# 初始化高级变异策略
+strategy = AdvancedMutationStrategy(ucb_alpha=1.0)
+
+# 小规模语言模型架构
+architecture = {
+    "type": "transformer",
+    "num_layers": 4,
+    "hidden_size": 256,
+    "num_heads": 4,
+    "ffn_dim": 512,
+    "dropout": 0.1,
+    "vocab_size": 10000
+}
+
+# 使用高级变异（自适应率 + 分层策略 + UCB选择）
+mutated, description = strategy.mutate_transformer_advanced(
+    architecture=architecture,
+    base_mutation_rate=0.3,
+    individual_fitness=75.0,      # 当前个体适应度
+    individual_age=5,              # 个体年龄（代数）
+    population_diversity=0.5,      # 种群多样性
+    generation=30,                 # 当前世代
+    best_fitness=100.0,           # 最佳适应度
+    max_parameters=50_000_000     # 参数预算（50M）
+)
+
+# 查看变异统计
+stats = strategy.get_mutation_statistics()
+print(f"总变异次数: {stats['total_mutations']}")
+print(f"成功率: {stats['overall_success_rate']:.2%}")
+```
+
+**关键优化特性**：
+
+1. **自适应变异率**：根据多种因素动态调整
+   - 高适应度个体 → 降低变异率（保留优秀基因）
+   - 年轻个体 → 提高变异率（增加探索）
+   - 低多样性 → 提高变异率（防止早熟收敛）
+   - 早期世代 → 提高变异率（探索阶段）
+
+2. **分层策略**：不同进化阶段使用不同策略
+   - **探索期（0-20代）**：大幅变异，探索搜索空间
+   - **平衡期（20-60代）**：中等变异，平衡探索与利用
+   - **利用期（60+代）**：小幅变异，精细调优
+
+3. **UCB操作选择**：智能选择变异操作
+   - 记录每种操作的成功率
+   - 使用Upper Confidence Bound平衡探索与利用
+   - 自动学习最优变异策略
+
+4. **小模型优化**：专为小规模语言模型设计
+   - 偏好较少层数（2-12层）
+   - 偏好较小隐藏维度（128-768）
+   - 参数预算限制（防止过大模型）
+   - Token限制考虑
 
 ## 📊 架构设计
 
