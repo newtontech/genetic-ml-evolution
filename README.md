@@ -73,6 +73,41 @@ print(f"验证精度: {best_model.accuracy:.2%}")
 
 ### 高级变异策略（NEW! 🎉）
 
+#### 方式一：直接使用遗传算法（推荐）
+
+```python
+from genetic_ml_evolution import GeneticAlgorithm
+
+# 创建遗传算法（自动启用高级变异）
+engine = GeneticAlgorithm(
+    population_size=20,
+    mutation_rate=0.3,
+    use_advanced_mutation=True,  # 启用高级变异策略
+    max_parameters=50_000_000,   # 50M参数预算
+    ucb_alpha=1.0,               # UCB探索参数
+    task_type="language"
+)
+
+# 定义适应度函数
+def fitness_function(architecture):
+    # 评估架构性能
+    return evaluate_model(architecture)
+
+# 开始进化
+best_model = engine.run(
+    fitness_function=fitness_function,
+    max_generations=50,
+    verbose=True
+)
+
+# 查看统计信息
+stats = engine.get_statistics()
+print(f"最佳适应度: {stats['best_fitness']:.2f}")
+print(f"变异成功率: {stats['mutation_stats']['overall_success_rate']:.2%}")
+```
+
+#### 方式二：直接使用高级变异策略
+
 ```python
 from genetic_ml_evolution import AdvancedMutationStrategy
 
