@@ -273,50 +273,79 @@ class ArchitectureCache:
         return results
     
     def get_top_performing(
-        self, 
+        self,
         metric: str = "accuracy",
         limit: int = 10,
         arch_type: Optional[str] = None
-    ) -> List[Tuple[Dict[str, Any], float]]:
+    ) -> List[Tuple[Dict[str, Any], Dict[str, float]]]:
         """
         Get top performing architectures based on a specific metric.
-        
+
         Args:
             metric: Performance metric to sort by (default: "accuracy")
             limit: Number of top results to return
             arch_type: Filter by architecture type (optional)
-            
+
         Returns:
-            List of (architecture, metric_value) tuples
+            List of (architecture, metrics_dict) tuples
         """
         cursor = self.conn.cursor()
-        
+
         # Note: This is a simplified approach. For better performance,
         # consider storing metrics as separate columns for sorting.
         if arch_type:
             cursor.execute('''
-                SELECT architecture_json, performance_metrics 
-                FROM architecture_cache 
+                SELECT architecture_json, performance_metrics
+                FROM architecture_cache
                 WHERE architecture_type = ?
             ''', (arch_type,))
         else:
             cursor.execute('''
-                SELECT architecture_json, performance_metrics 
+                SELECT architecture_json, performance_metrics
                 FROM architecture_cache
             ''')
-        
+
         results = []
         for row in cursor.fetchall():
             arch = json.loads(row['architecture_json'])
             metrics = json.loads(row['performance_metrics'])
             if metric in metrics:
-                results.append((arch, metrics[metric]))
-        
+                results.append((arch, metrics))
+
         # Sort by metric (descending for accuracy, ascending for loss)
         reverse = metric in ["accuracy", "f1", "precision", "recall"]
-        results.sort(key=lambda x: x[1], reverse=reverse)
-        
+        results.sort(key=lambda x: x[1][metric], reverse=reverse)
+
         return results[:limit]
+
+    def delete(self, architecture: Dict[str, Any]) -> bool:
+        """
+        Delete an architecture from the cache.
+
+        Args:
+            architecture: Architecture configuration dictionary
+
+        Returns:
+            True if deleted successfully, False if not found
+        """
+        arch_hash = self._compute_hash(architecture)
+        cursor = self.conn.cursor()
+
+        cursor.execute('''
+            SELECT id FROM architecture_cache WHERE architecture_hash = ?
+        ''', (arch_hash,))
+        row = cursor.fetchone()
+
+        if row:
+            cursor.execute('''
+                DELETE FROM architecture_cache WHERE id = ?
+            ''', (row['id'],))
+            self.conn.commit()
+            logger.debug(f"Deleted architecture with hash {arch_hash[:16]}...")
+            return True
+        else:
+            logger.debug(f"Architecture with hash {arch_hash[:16]}... not found")
+            return False
     
     def clear(self) -> int:
         """
