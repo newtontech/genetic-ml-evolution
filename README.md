@@ -23,9 +23,25 @@
 
 ### 2. 创新技术
 - 🧬 **代理辅助进化**：使用代理模型预测架构性能
-- 💾 **缓存优化**：分布式 + 本地缓存
+- 💾 **智能缓存系统**：SQLite 缓存架构性能，支持线程安全和 TTL 过期
 - 🎯 **多目标优化**：精度 + 速度 + 显存
 - 🔄 **自适应策略**：动态调整进化参数
+
+### 3. 智能缓存系统（NEW! 🎉）
+- ✅ **SQLite 后端**：持久化存储架构评估结果
+- ✅ **线程安全**：支持多线程并发访问
+- ✅ **缓存过期**：TTL 机制自动清理过期数据
+- ✅ **性能统计**：命中率、访问次数等详细统计
+- ✅ **导入导出**：JSON 格式备份和迁移
+- 📖 [缓存系统完整文档](docs/cache-system-guide.md)
+
+### 4. 高级变异策略（NEW! 🎉）
+- 🎯 **智能自适应变异率**：基于个体适应度、年龄、种群多样性和世代数动态调整
+- 📊 **分层变异策略**：探索期（0-20代）→ 平衡期（20-60代）→ 利用期（60+代）
+- 🎰 **UCB操作选择**：使用Upper Confidence Bound算法选择最优变异操作
+- 💡 **Token限制优化**：考虑小规模语言模型的token限制和生成质量
+- 📈 **参数预算控制**：限制模型参数数量，防止过大的模型
+- 🔍 **成功率追踪**：记录每种变异操作的成功率，优化未来选择
 
 ## 📦 安装
 
@@ -42,6 +58,8 @@ pip install arxiv arxiv-dl scholarly semanticscholar
 ```
 
 ## 🔧 快速开始
+
+### 基础使用
 
 ```python
 from genetic_ml_evolution import EvolutionEngine
@@ -60,6 +78,102 @@ best_model = engine.evolve()
 print(f"最佳模型: {best_model.architecture}")
 print(f"验证精度: {best_model.accuracy:.2%}")
 ```
+
+### 高级变异策略（NEW! 🎉）
+
+#### 方式一：直接使用遗传算法（推荐）
+
+```python
+from genetic_ml_evolution import GeneticAlgorithm
+
+# 创建遗传算法（自动启用高级变异）
+engine = GeneticAlgorithm(
+    population_size=20,
+    mutation_rate=0.3,
+    use_advanced_mutation=True,  # 启用高级变异策略
+    max_parameters=50_000_000,   # 50M参数预算
+    ucb_alpha=1.0,               # UCB探索参数
+    task_type="language"
+)
+
+# 定义适应度函数
+def fitness_function(architecture):
+    # 评估架构性能
+    return evaluate_model(architecture)
+
+# 开始进化
+best_model = engine.run(
+    fitness_function=fitness_function,
+    max_generations=50,
+    verbose=True
+)
+
+# 查看统计信息
+stats = engine.get_statistics()
+print(f"最佳适应度: {stats['best_fitness']:.2f}")
+print(f"变异成功率: {stats['mutation_stats']['overall_success_rate']:.2%}")
+```
+
+#### 方式二：直接使用高级变异策略
+
+```python
+from genetic_ml_evolution import AdvancedMutationStrategy
+
+# 初始化高级变异策略
+strategy = AdvancedMutationStrategy(ucb_alpha=1.0)
+
+# 小规模语言模型架构
+architecture = {
+    "type": "transformer",
+    "num_layers": 4,
+    "hidden_size": 256,
+    "num_heads": 4,
+    "ffn_dim": 512,
+    "dropout": 0.1,
+    "vocab_size": 10000
+}
+
+# 使用高级变异（自适应率 + 分层策略 + UCB选择）
+mutated, description = strategy.mutate_transformer_advanced(
+    architecture=architecture,
+    base_mutation_rate=0.3,
+    individual_fitness=75.0,      # 当前个体适应度
+    individual_age=5,              # 个体年龄（代数）
+    population_diversity=0.5,      # 种群多样性
+    generation=30,                 # 当前世代
+    best_fitness=100.0,           # 最佳适应度
+    max_parameters=50_000_000     # 参数预算（50M）
+)
+
+# 查看变异统计
+stats = strategy.get_mutation_statistics()
+print(f"总变异次数: {stats['total_mutations']}")
+print(f"成功率: {stats['overall_success_rate']:.2%}")
+```
+
+**关键优化特性**：
+
+1. **自适应变异率**：根据多种因素动态调整
+   - 高适应度个体 → 降低变异率（保留优秀基因）
+   - 年轻个体 → 提高变异率（增加探索）
+   - 低多样性 → 提高变异率（防止早熟收敛）
+   - 早期世代 → 提高变异率（探索阶段）
+
+2. **分层策略**：不同进化阶段使用不同策略
+   - **探索期（0-20代）**：大幅变异，探索搜索空间
+   - **平衡期（20-60代）**：中等变异，平衡探索与利用
+   - **利用期（60+代）**：小幅变异，精细调优
+
+3. **UCB操作选择**：智能选择变异操作
+   - 记录每种操作的成功率
+   - 使用Upper Confidence Bound平衡探索与利用
+   - 自动学习最优变异策略
+
+4. **小模型优化**：专为小规模语言模型设计
+   - 偏好较少层数（2-12层）
+   - 偏好较小隐藏维度（128-768）
+   - 参数预算限制（防止过大模型）
+   - Token限制考虑
 
 ## 📊 架构设计
 

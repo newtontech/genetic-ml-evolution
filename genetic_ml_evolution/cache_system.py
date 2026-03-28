@@ -17,8 +17,10 @@ import json
 import hashlib
 import os
 from typing import Dict, Any, Optional, List, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
+import threading
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
@@ -45,18 +47,40 @@ class ArchitectureCache:
         0.85
     """
     
-    def __init__(self, db_path: str = "architecture_cache.db"):
+    def __init__(
+        self, 
+        db_path: str = "architecture_cache.db",
+        ttl_seconds: Optional[int] = None,
+        enable_thread_safety: bool = True
+    ):
         """
         Initialize the cache system.
         
         Args:
             db_path: Path to SQLite database file. Defaults to "architecture_cache.db"
+            ttl_seconds: Time-to-live in seconds for cache entries (None = no expiration)
+            enable_thread_safety: Enable thread-safe operations (default: True)
         """
         self.db_path = db_path
         self.conn = None
         self.cache_hits = 0
         self.cache_misses = 0
+        self.ttl_seconds = ttl_seconds
+        self.enable_thread_safety = enable_thread_safety
+        
+        # Thread safety lock
+        self._lock = threading.RLock() if enable_thread_safety else None
+        
         self._initialize_database()
+    
+    @contextmanager
+    def _thread_safe(self):
+        """Context manager for thread-safe operations."""
+        if self._lock:
+            with self._lock:
+                yield
+        else:
+            yield
     
     def _initialize_database(self) -> None:
         """Create database tables if they don't exist."""
@@ -65,52 +89,54 @@ class ArchitectureCache:
         if db_dir and not os.path.exists(db_dir):
             os.makedirs(db_dir, exist_ok=True)
         
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        
-        cursor = self.conn.cursor()
-        
-        # Main cache table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS architecture_cache (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                architecture_hash TEXT UNIQUE NOT NULL,
-                architecture_json TEXT NOT NULL,
-                architecture_type TEXT,
-                performance_metrics TEXT NOT NULL,
-                evaluation_time REAL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                access_count INTEGER DEFAULT 1
-            )
-        ''')
-        
-        # Index for fast hash lookups
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_architecture_hash 
-            ON architecture_cache(architecture_hash)
-        ''')
-        
-        # Index for type-based queries
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_architecture_type 
-            ON architecture_cache(architecture_type)
-        ''')
-        
-        # Statistics table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS cache_statistics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                total_entries INTEGER,
-                cache_hits INTEGER,
-                cache_misses INTEGER,
-                hit_rate REAL
-            )
-        ''')
-        
-        self.conn.commit()
-        logger.info(f"Cache database initialized at {self.db_path}")
+        with self._thread_safe():
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+            
+            cursor = self.conn.cursor()
+            
+            # Main cache table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS architecture_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    architecture_hash TEXT UNIQUE NOT NULL,
+                    architecture_json TEXT NOT NULL,
+                    architecture_type TEXT,
+                    performance_metrics TEXT NOT NULL,
+                    evaluation_time REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    access_count INTEGER DEFAULT 1,
+                    expires_at TIMESTAMP
+                )
+            ''')
+            
+            # Index for fast hash lookups
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_architecture_hash 
+                ON architecture_cache(architecture_hash)
+            ''')
+            
+            # Index for type-based queries
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_architecture_type 
+                ON architecture_cache(architecture_type)
+            ''')
+            
+            # Statistics table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS cache_statistics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    total_entries INTEGER,
+                    cache_hits INTEGER,
+                    cache_misses INTEGER,
+                    hit_rate REAL
+                )
+            ''')
+            
+            self.conn.commit()
+            logger.info(f"Cache database initialized at {self.db_path}")
     
     def _compute_hash(self, architecture: Dict[str, Any]) -> str:
         """
@@ -130,7 +156,8 @@ class ArchitectureCache:
         self, 
         architecture: Dict[str, Any], 
         metrics: Dict[str, float],
-        evaluation_time: Optional[float] = None
+        evaluation_time: Optional[float] = None,
+        ttl_seconds: Optional[int] = None
     ) -> bool:
         """
         Store an architecture and its performance metrics in the cache.
@@ -139,6 +166,7 @@ class ArchitectureCache:
             architecture: Architecture configuration dictionary
             metrics: Performance metrics (e.g., {"accuracy": 0.85, "loss": 0.15})
             evaluation_time: Time taken for evaluation (optional)
+            ttl_seconds: Time-to-live in seconds (overrides default TTL)
             
         Returns:
             True if stored successfully, False if architecture already exists
@@ -156,24 +184,31 @@ class ArchitectureCache:
         arch_type = architecture.get("type", "unknown")
         metrics_json = json.dumps(metrics, sort_keys=True)
         
-        cursor = self.conn.cursor()
+        # Calculate expiration time
+        ttl = ttl_seconds if ttl_seconds is not None else self.ttl_seconds
+        expires_at = None
+        if ttl is not None:
+            expires_at = datetime.now() + timedelta(seconds=ttl)
         
-        try:
-            cursor.execute('''
-                INSERT INTO architecture_cache 
-                (architecture_hash, architecture_json, architecture_type, 
-                 performance_metrics, evaluation_time)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (arch_hash, arch_json, arch_type, metrics_json, evaluation_time))
+        with self._thread_safe():
+            cursor = self.conn.cursor()
             
-            self.conn.commit()
-            logger.debug(f"Stored architecture with hash {arch_hash[:16]}...")
-            return True
-            
-        except sqlite3.IntegrityError:
-            # Architecture already exists
-            logger.debug(f"Architecture with hash {arch_hash[:16]}... already exists")
-            return False
+            try:
+                cursor.execute('''
+                    INSERT INTO architecture_cache 
+                    (architecture_hash, architecture_json, architecture_type, 
+                     performance_metrics, evaluation_time, expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (arch_hash, arch_json, arch_type, metrics_json, evaluation_time, expires_at))
+                
+                self.conn.commit()
+                logger.debug(f"Stored architecture with hash {arch_hash[:16]}...")
+                return True
+                
+            except sqlite3.IntegrityError:
+                # Architecture already exists
+                logger.debug(f"Architecture with hash {arch_hash[:16]}... already exists")
+                return False
     
     def lookup(self, architecture: Dict[str, Any]) -> Optional[Dict[str, float]]:
         """
@@ -183,36 +218,48 @@ class ArchitectureCache:
             architecture: Architecture configuration dictionary
             
         Returns:
-            Performance metrics dictionary if found, None otherwise
+            Performance metrics dictionary if found and not expired, None otherwise
         """
         arch_hash = self._compute_hash(architecture)
         
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT performance_metrics, id 
-            FROM architecture_cache 
-            WHERE architecture_hash = ?
-        ''', (arch_hash,))
-        
-        row = cursor.fetchone()
-        
-        if row:
-            self.cache_hits += 1
-            # Update access statistics
+        with self._thread_safe():
+            cursor = self.conn.cursor()
             cursor.execute('''
-                UPDATE architecture_cache 
-                SET last_accessed = CURRENT_TIMESTAMP,
-                    access_count = access_count + 1
-                WHERE id = ?
-            ''', (row['id'],))
-            self.conn.commit()
+                SELECT performance_metrics, id, expires_at 
+                FROM architecture_cache 
+                WHERE architecture_hash = ?
+            ''', (arch_hash,))
             
-            logger.debug(f"Cache hit for architecture {arch_hash[:16]}...")
-            return json.loads(row['performance_metrics'])
-        else:
-            self.cache_misses += 1
-            logger.debug(f"Cache miss for architecture {arch_hash[:16]}...")
-            return None
+            row = cursor.fetchone()
+            
+            if row:
+                # Check if entry has expired
+                if row['expires_at'] is not None:
+                    expires_at = datetime.fromisoformat(row['expires_at'])
+                    if datetime.now() > expires_at:
+                        # Entry has expired, delete it
+                        cursor.execute('DELETE FROM architecture_cache WHERE id = ?', (row['id'],))
+                        self.conn.commit()
+                        self.cache_misses += 1
+                        logger.debug(f"Cache entry expired for architecture {arch_hash[:16]}...")
+                        return None
+                
+                self.cache_hits += 1
+                # Update access statistics
+                cursor.execute('''
+                    UPDATE architecture_cache 
+                    SET last_accessed = CURRENT_TIMESTAMP,
+                        access_count = access_count + 1
+                    WHERE id = ?
+                ''', (row['id'],))
+                self.conn.commit()
+                
+                logger.debug(f"Cache hit for architecture {arch_hash[:16]}...")
+                return json.loads(row['performance_metrics'])
+            else:
+                self.cache_misses += 1
+                logger.debug(f"Cache miss for architecture {arch_hash[:16]}...")
+                return None
     
     def exists(self, architecture: Dict[str, Any]) -> bool:
         """
@@ -273,50 +320,118 @@ class ArchitectureCache:
         return results
     
     def get_top_performing(
-        self, 
+        self,
         metric: str = "accuracy",
         limit: int = 10,
         arch_type: Optional[str] = None
-    ) -> List[Tuple[Dict[str, Any], float]]:
+    ) -> List[Tuple[Dict[str, Any], Dict[str, float]]]:
         """
         Get top performing architectures based on a specific metric.
-        
+
         Args:
             metric: Performance metric to sort by (default: "accuracy")
             limit: Number of top results to return
             arch_type: Filter by architecture type (optional)
-            
+
         Returns:
-            List of (architecture, metric_value) tuples
+            List of (architecture, metrics_dict) tuples
         """
         cursor = self.conn.cursor()
-        
+
         # Note: This is a simplified approach. For better performance,
         # consider storing metrics as separate columns for sorting.
         if arch_type:
             cursor.execute('''
-                SELECT architecture_json, performance_metrics 
-                FROM architecture_cache 
+                SELECT architecture_json, performance_metrics
+                FROM architecture_cache
                 WHERE architecture_type = ?
             ''', (arch_type,))
         else:
             cursor.execute('''
-                SELECT architecture_json, performance_metrics 
+                SELECT architecture_json, performance_metrics
                 FROM architecture_cache
             ''')
-        
+
         results = []
         for row in cursor.fetchall():
             arch = json.loads(row['architecture_json'])
             metrics = json.loads(row['performance_metrics'])
             if metric in metrics:
-                results.append((arch, metrics[metric]))
-        
+                results.append((arch, metrics))
+
         # Sort by metric (descending for accuracy, ascending for loss)
         reverse = metric in ["accuracy", "f1", "precision", "recall"]
-        results.sort(key=lambda x: x[1], reverse=reverse)
-        
+        results.sort(key=lambda x: x[1][metric], reverse=reverse)
+
         return results[:limit]
+
+    def delete(self, architecture: Dict[str, Any]) -> bool:
+        """
+        Delete an architecture from the cache.
+
+        Args:
+            architecture: Architecture configuration dictionary
+
+        Returns:
+            True if deleted successfully, False if not found
+        """
+        arch_hash = self._compute_hash(architecture)
+        cursor = self.conn.cursor()
+
+        cursor.execute('''
+            SELECT id FROM architecture_cache WHERE architecture_hash = ?
+        ''', (arch_hash,))
+        row = cursor.fetchone()
+
+        if row:
+            cursor.execute('''
+                DELETE FROM architecture_cache WHERE id = ?
+            ''', (row['id'],))
+            self.conn.commit()
+            logger.debug(f"Deleted architecture with hash {arch_hash[:16]}...")
+            return True
+        else:
+            logger.debug(f"Architecture with hash {arch_hash[:16]}... not found")
+            return False
+    
+    def cleanup_expired(self) -> int:
+        """
+        Remove expired entries from the cache.
+        
+        Returns:
+            Number of expired entries removed
+        """
+        with self._thread_safe():
+            cursor = self.conn.cursor()
+            
+            # Get all entries with expiration
+            cursor.execute('''
+                SELECT id, expires_at 
+                FROM architecture_cache 
+                WHERE expires_at IS NOT NULL
+            ''')
+            
+            now = datetime.now()
+            expired_ids = []
+            
+            for row in cursor.fetchall():
+                expires_at = datetime.fromisoformat(row[1])
+                if expires_at < now:
+                    expired_ids.append(row[0])
+            
+            count = len(expired_ids)
+            
+            if count > 0:
+                # Delete expired entries
+                placeholders = ','.join('?' * count)
+                cursor.execute(f'''
+                    DELETE FROM architecture_cache 
+                    WHERE id IN ({placeholders})
+                ''', expired_ids)
+                self.conn.commit()
+                logger.info(f"Cleaned up {count} expired cache entries")
+            
+            return count
     
     def clear(self) -> int:
         """

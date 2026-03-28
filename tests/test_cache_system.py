@@ -6,6 +6,8 @@ Unit Tests for SQLite Cache System
 import pytest
 import tempfile
 import os
+import time
+import threading
 from typing import Dict, Any
 
 from genetic_ml_evolution.cache_system import ArchitectureCache
@@ -448,6 +450,232 @@ class TestCacheIntegration:
         stats_after = model.get_cache_statistics()
         
         assert stats_after["cache_hits"] > stats_before["cache_hits"]
+
+
+class TestCacheThreadSafety:
+    """测试缓存系统的线程安全性"""
+    
+    @pytest.fixture
+    def temp_db(self):
+        """创建临时数据库文件"""
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+            db_path = f.name
+        yield db_path
+        # Cleanup
+        if os.path.exists(db_path):
+            os.remove(db_path)
+    
+    def test_concurrent_stores(self, temp_db):
+        """测试并发存储"""
+        cache = ArchitectureCache(db_path=temp_db, enable_thread_safety=True)
+        
+        num_threads = 10
+        results = []
+        
+        def store_architecture(i):
+            arch = {"type": "transformer", "num_layers": i}
+            metrics = {"accuracy": 0.8 + i * 0.01}
+            result = cache.store(arch, metrics)
+            results.append(result)
+        
+        threads = [
+            threading.Thread(target=store_architecture, args=(i,))
+            for i in range(num_threads)
+        ]
+        
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        
+        # 验证所有架构都被存储
+        assert len(cache) == num_threads
+        cache.close()
+    
+    def test_concurrent_reads_and_writes(self, temp_db):
+        """测试并发读写"""
+        cache = ArchitectureCache(db_path=temp_db, enable_thread_safety=True)
+        
+        # 预先存储一些架构
+        for i in range(5):
+            arch = {"type": "transformer", "num_layers": i}
+            cache.store(arch, {"accuracy": 0.8})
+        
+        read_results = []
+        write_results = []
+        
+        def read_architecture(i):
+            arch = {"type": "transformer", "num_layers": i % 5}
+            result = cache.lookup(arch)
+            read_results.append(result is not None)
+        
+        def write_architecture(i):
+            arch = {"type": "cnn", "num_blocks": i}
+            result = cache.store(arch, {"accuracy": 0.75})
+            write_results.append(result)
+        
+        threads = []
+        # 5个读线程
+        for i in range(5):
+            threads.append(threading.Thread(target=read_architecture, args=(i,)))
+        # 5个写线程
+        for i in range(5):
+            threads.append(threading.Thread(target=write_architecture, args=(i,)))
+        
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        
+        # 验证读操作都成功
+        assert all(read_results)
+        cache.close()
+
+
+class TestCacheExpiration:
+    """测试缓存过期机制"""
+    
+    @pytest.fixture
+    def temp_db(self):
+        """创建临时数据库文件"""
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+            db_path = f.name
+        yield db_path
+        # Cleanup
+        if os.path.exists(db_path):
+            os.remove(db_path)
+    
+    def test_ttl_expiration(self, temp_db):
+        """测试 TTL 过期"""
+        # 创建带 2 秒 TTL 的缓存
+        cache = ArchitectureCache(db_path=temp_db, ttl_seconds=2)
+        
+        arch = {"type": "transformer", "num_layers": 6}
+        cache.store(arch, {"accuracy": 0.85})
+        
+        # 立即查询应该成功
+        result = cache.lookup(arch)
+        assert result is not None
+        assert result["accuracy"] == pytest.approx(0.85, rel=0.01)
+        
+        # 等待 TTL 过期
+        time.sleep(3)
+        
+        # 过期后查询应该返回 None
+        result = cache.lookup(arch)
+        assert result is None
+        
+        cache.close()
+    
+    def test_custom_ttl_per_entry(self, temp_db):
+        """测试每个条目的自定义 TTL"""
+        cache = ArchitectureCache(db_path=temp_db, ttl_seconds=10)
+        
+        arch1 = {"type": "transformer", "num_layers": 6}
+        arch2 = {"type": "cnn", "num_blocks": 4}
+        
+        # arch1 使用默认 TTL (10秒)
+        cache.store(arch1, {"accuracy": 0.85})
+        
+        # arch2 使用自定义 TTL (1秒)
+        cache.store(arch2, {"accuracy": 0.80}, ttl_seconds=1)
+        
+        # 等待 2 秒
+        time.sleep(2)
+        
+        # arch1 应该还在
+        result1 = cache.lookup(arch1)
+        assert result1 is not None
+        
+        # arch2 应该已过期
+        result2 = cache.lookup(arch2)
+        assert result2 is None
+        
+        cache.close()
+    
+    def test_cleanup_expired(self, temp_db):
+        """测试清理过期条目"""
+        cache = ArchitectureCache(db_path=temp_db, ttl_seconds=1)
+        
+        # 存储多个架构
+        for i in range(5):
+            arch = {"type": "transformer", "num_layers": i}
+            cache.store(arch, {"accuracy": 0.8})
+        
+        assert len(cache) == 5
+        
+        # 等待过期
+        time.sleep(2)
+        
+        # 手动清理
+        cleaned = cache.cleanup_expired()
+        assert cleaned == 5
+        assert len(cache) == 0
+        
+        cache.close()
+    
+    def test_no_expiration_when_ttl_is_none(self, temp_db):
+        """测试 TTL 为 None 时不过期"""
+        cache = ArchitectureCache(db_path=temp_db, ttl_seconds=None)
+        
+        arch = {"type": "transformer", "num_layers": 6}
+        cache.store(arch, {"accuracy": 0.85})
+        
+        # 等待一段时间
+        time.sleep(2)
+        
+        # 应该仍然可以查询到
+        result = cache.lookup(arch)
+        assert result is not None
+        
+        cache.close()
+
+
+class TestCacheStatistics:
+    """测试缓存统计功能"""
+    
+    @pytest.fixture
+    def temp_db(self):
+        """创建临时数据库文件"""
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+            db_path = f.name
+        yield db_path
+        # Cleanup
+        if os.path.exists(db_path):
+            os.remove(db_path)
+    
+    def test_detailed_statistics(self, temp_db):
+        """测试详细统计信息"""
+        cache = ArchitectureCache(db_path=temp_db)
+        
+        # 存储不同类型的架构
+        cache.store(
+            {"type": "transformer", "num_layers": 6},
+            {"accuracy": 0.85},
+            evaluation_time=10.5
+        )
+        cache.store(
+            {"type": "cnn", "num_blocks": 4},
+            {"accuracy": 0.80},
+            evaluation_time=8.0
+        )
+        
+        # 多次查询
+        cache.lookup({"type": "transformer", "num_layers": 6})
+        cache.lookup({"type": "transformer", "num_layers": 6})
+        cache.lookup({"type": "unknown"})
+        
+        stats = cache.get_statistics()
+        
+        assert stats["total_entries"] == 2
+        assert stats["entries_by_type"]["transformer"] == 1
+        assert stats["entries_by_type"]["cnn"] == 1
+        assert stats["cache_hits"] == 2
+        assert stats["cache_misses"] == 1
+        assert stats["hit_rate_percent"] == pytest.approx(66.67, rel=0.1)
+        assert stats["average_evaluation_time"] == pytest.approx(9.25, rel=0.01)
+        
+        cache.close()
 
 
 if __name__ == "__main__":

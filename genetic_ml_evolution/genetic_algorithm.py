@@ -21,6 +21,7 @@ from copy import deepcopy
 
 from .surrogate_model import SurrogateModel
 from .cache_system import ArchitectureCache
+from .advanced_mutation import AdvancedMutationStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -454,7 +455,10 @@ class GeneticAlgorithm:
         tournament_size: int = 3,
         surrogate_model: Optional[SurrogateModel] = None,
         cache_db_path: Optional[str] = None,
-        task_type: str = "language"
+        task_type: str = "language",
+        use_advanced_mutation: bool = True,
+        max_parameters: int = 100_000_000,
+        ucb_alpha: float = 1.0
     ):
         """
         Initialize the genetic algorithm.
@@ -468,6 +472,9 @@ class GeneticAlgorithm:
             surrogate_model: Optional surrogate model for guided mutations
             cache_db_path: Path to cache database
             task_type: Type of task ("language", "image", "multimodal")
+            use_advanced_mutation: Whether to use advanced mutation strategies (default: True)
+            max_parameters: Maximum number of parameters allowed (default: 100M)
+            ucb_alpha: UCB exploration parameter for advanced mutation (default: 1.0)
         """
         self.population_size = population_size
         self.mutation_rate = mutation_rate
@@ -476,9 +483,17 @@ class GeneticAlgorithm:
         self.tournament_size = tournament_size
         self.surrogate_model = surrogate_model
         self.task_type = task_type
+        self.use_advanced_mutation = use_advanced_mutation
+        self.max_parameters = max_parameters
         
         # Initialize cache
         self.cache = ArchitectureCache(cache_db_path) if cache_db_path else None
+        
+        # Initialize advanced mutation strategy if enabled
+        if use_advanced_mutation:
+            self.advanced_mutation_strategy = AdvancedMutationStrategy(ucb_alpha=ucb_alpha)
+        else:
+            self.advanced_mutation_strategy = None
         
         # Population and statistics
         self.population: List[Individual] = []
@@ -645,30 +660,51 @@ class GeneticAlgorithm:
         """
         arch_type = individual.architecture.get("type", "transformer")
         
-        if arch_type == "transformer":
-            mutated_arch, mutation_desc = MutationStrategy.mutate_transformer(
-                individual.architecture,
-                self.mutation_rate,
-                strategy,
-                self.surrogate_model,
-                self.generation
+        # Use advanced mutation strategy if enabled
+        if self.use_advanced_mutation and arch_type == "transformer":
+            # Calculate population diversity for adaptive mutation
+            diversity = self._calculate_diversity()
+            
+            # Get best fitness (or use individual's fitness if no best yet)
+            best_fitness = self.best_individual.fitness if self.best_individual else individual.fitness
+            
+            mutated_arch, mutation_desc = self.advanced_mutation_strategy.mutate_transformer_advanced(
+                architecture=individual.architecture,
+                base_mutation_rate=self.mutation_rate,
+                individual_fitness=individual.fitness,
+                individual_age=individual.age,
+                population_diversity=diversity,
+                generation=self.generation,
+                best_fitness=best_fitness,
+                surrogate_model=self.surrogate_model,
+                max_parameters=self.max_parameters
             )
-        elif arch_type == "cnn":
-            mutated_arch, mutation_desc = MutationStrategy.mutate_cnn(
-                individual.architecture,
-                self.mutation_rate,
-                strategy,
-                self.surrogate_model,
-                self.generation
-            )
-        else:  # multimodal
-            mutated_arch, mutation_desc = MutationStrategy.mutate_multimodal(
-                individual.architecture,
-                self.mutation_rate,
-                strategy,
-                self.surrogate_model,
-                self.generation
-            )
+        else:
+            # Use basic mutation strategy
+            if arch_type == "transformer":
+                mutated_arch, mutation_desc = MutationStrategy.mutate_transformer(
+                    individual.architecture,
+                    self.mutation_rate,
+                    strategy,
+                    self.surrogate_model,
+                    self.generation
+                )
+            elif arch_type == "cnn":
+                mutated_arch, mutation_desc = MutationStrategy.mutate_cnn(
+                    individual.architecture,
+                    self.mutation_rate,
+                    strategy,
+                    self.surrogate_model,
+                    self.generation
+                )
+            else:  # multimodal
+                mutated_arch, mutation_desc = MutationStrategy.mutate_multimodal(
+                    individual.architecture,
+                    self.mutation_rate,
+                    strategy,
+                    self.surrogate_model,
+                    self.generation
+                )
         
         return Individual(
             architecture=mutated_arch,
@@ -815,26 +851,33 @@ class GeneticAlgorithm:
             ind for ind in self.population if ind.fitness is not None
         ]
         
-        if not valid_individuals:
-            return {
-                "generation": self.generation,
-                "population_size": len(self.population),
-                "evaluated": 0
-            }
-        
-        fitnesses = [ind.fitness for ind in valid_individuals]
-        
-        return {
+        stats = {
             "generation": self.generation,
             "population_size": len(self.population),
             "evaluated": len(valid_individuals),
+            "use_advanced_mutation": self.use_advanced_mutation,
+            "max_parameters": self.max_parameters
+        }
+        
+        if not valid_individuals:
+            return stats
+        
+        fitnesses = [ind.fitness for ind in valid_individuals]
+        
+        stats.update({
             "best_fitness": max(fitnesses),
             "avg_fitness": np.mean(fitnesses),
             "min_fitness": min(fitnesses),
             "std_fitness": np.std(fitnesses),
             "diversity": self._calculate_diversity(),
             "cache_stats": self.cache.get_statistics() if self.cache else None
-        }
+        })
+        
+        # Add mutation statistics if using advanced mutation
+        if self.use_advanced_mutation and self.advanced_mutation_strategy:
+            stats["mutation_stats"] = self.advanced_mutation_strategy.get_mutation_statistics()
+        
+        return stats
     
     def run(
         self,
