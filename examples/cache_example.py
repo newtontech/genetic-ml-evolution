@@ -158,8 +158,8 @@ def main():
     
     top_archs = cache.get_top_performing(metric="accuracy", limit=3)
     print(f"Top 3 architectures by accuracy:")
-    for i, (arch, acc) in enumerate(top_archs, 1):
-        print(f"  {i+1}. {arch['type']} - accuracy: {acc:.5f}")
+    for i, (arch, metrics) in enumerate(top_archs, 1):
+        print(f"  {i}. {arch['type']} - accuracy: {metrics['accuracy']:.5f}")
     
     # Example 7: Export and import
     print("\n" + "=" * 60)

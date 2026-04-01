@@ -231,6 +231,31 @@ class ArchitectureCache:
         ''', (arch_hash,))
         return cursor.fetchone() is not None
     
+    def delete(self, architecture: Dict[str, Any]) -> bool:
+        """
+        Delete an architecture from the cache.
+        
+        Args:
+            architecture: Architecture configuration dictionary
+            
+        Returns:
+            True if architecture was deleted, False if it didn't exist
+        """
+        arch_hash = self._compute_hash(architecture)
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            DELETE FROM architecture_cache WHERE architecture_hash = ?
+        ''', (arch_hash,))
+        
+        self.conn.commit()
+        
+        deleted = cursor.rowcount > 0
+        if deleted:
+            logger.debug(f"Deleted architecture with hash {arch_hash[:16]}...")
+        
+        return deleted
+    
     def get_by_type(
         self, 
         arch_type: str, 
@@ -277,7 +302,7 @@ class ArchitectureCache:
         metric: str = "accuracy",
         limit: int = 10,
         arch_type: Optional[str] = None
-    ) -> List[Tuple[Dict[str, Any], float]]:
+    ) -> List[Tuple[Dict[str, Any], Dict[str, float]]]:
         """
         Get top performing architectures based on a specific metric.
         
@@ -287,7 +312,7 @@ class ArchitectureCache:
             arch_type: Filter by architecture type (optional)
             
         Returns:
-            List of (architecture, metric_value) tuples
+            List of (architecture, metrics_dict) tuples sorted by the specified metric
         """
         cursor = self.conn.cursor()
         
@@ -310,11 +335,11 @@ class ArchitectureCache:
             arch = json.loads(row['architecture_json'])
             metrics = json.loads(row['performance_metrics'])
             if metric in metrics:
-                results.append((arch, metrics[metric]))
+                results.append((arch, metrics))
         
         # Sort by metric (descending for accuracy, ascending for loss)
         reverse = metric in ["accuracy", "f1", "precision", "recall"]
-        results.sort(key=lambda x: x[1], reverse=reverse)
+        results.sort(key=lambda x: x[1][metric], reverse=reverse)
         
         return results[:limit]
     

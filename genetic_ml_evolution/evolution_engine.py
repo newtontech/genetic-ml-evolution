@@ -10,12 +10,13 @@ Key features for SLM optimization:
 - Resource-aware mutation rates
 - Early stopping via surrogate predictions
 - Progressive complexity from simple to complex architectures
+- Performance caching to avoid redundant evaluations
 """
 
 import random
 import logging
 from typing import Dict, Any, List, Optional, Callable, Tuple
- import time
+import time
 
 from .genetic_operators import (
     ArchitectureGene,
@@ -23,7 +24,7 @@ from .genetic_operators import (
     SLMCrossoverOperators,
     SLMSelectionOperators,
     tournament_selection,
-    rank_selection
+    rank_selection,
     elitism_selection
 )
 from .surrogate_model import SurrogateModel
@@ -45,7 +46,6 @@ class EvolutionConfig:
     crossover_rate: float = 0.7
     mutation_strength: str = "moderate"  # conservative, moderate, aggressive
     
-    
     # Early stopping
     early_stopping_patience: int = 5
     min_improvement_threshold: float = 1.0
@@ -56,7 +56,6 @@ class EvolutionConfig:
     # Task settings
     task_type: str = "language"  # language, image, multimodal
     dataset: str = "imdb"
-    # cifar10"
     
     # Logging
     log_level: str = "INFO"
@@ -66,9 +65,10 @@ class EvolutionConfig:
     
     # Cache settings
     cache_db_path: Optional[str] = None
+    use_cache: bool = True
     
+    # Surrogate settings
     use_surrogate: bool = True
-    
     surrogate_model_type: str = "ensemble"
 
 
@@ -80,6 +80,7 @@ class EvolutionEngine:
     - Reduced computational requirements
     - Adaptive mutation strategies
     - Efficient memory usage
+    - Performance caching to avoid redundant evaluations
     """
     
     def __init__(self, config: Optional[EvolutionConfig] = None):
@@ -102,15 +103,17 @@ class EvolutionEngine:
         self.selector = SLMSelectionOperators()
         
         # Initialize surrogate model
-        cache_db_path = f"{self.config.task_type}_surrogate.db"
- if self.config.cache_db_path else None
         self.surrogate = SurrogateModel(
             model_type=self.config.surrogate_model_type,
             cache_db_path=self.config.cache_db_path
-        )
+        ) if self.config.use_surrogate else None
         
         # Initialize cache if configured
-        self.cache = ArchitectureCache(self.config.cache_db_path) if self.config.cache_db_path else None
+        if self.config.use_cache and self.config.cache_db_path:
+            self.cache = ArchitectureCache(self.config.cache_db_path)
+            logger.info(f"Cache system initialized at {self.config.cache_db_path}")
+        else:
+            self.cache = None
         
         # Population
         self.population: List[ArchitectureGene] = []
@@ -123,18 +126,23 @@ class EvolutionEngine:
         self.start_time = time.time()
         self.last_improvement_time = self.start_time
         
+        # Cache statistics
+        self.cache_hits = 0
+        self.cache_misses = 0
+        
         logger.info(
             f"EvolutionEngine initialized with config: "
             f"population_size={self.config.population_size}, "
             f"generations={self.config.generations}, "
-            f"task_type={self.config.task_type}"
+            f"task_type={self.config.task_type}, "
+            f"cache_enabled={self.cache is not None}"
         )
     
     def _initialize_population(self) -> None:
         """Initialize the population with random architectures."""
         arch_type_map = {
-            "transformer": self._random_transformer,
-            "cnn": self._random_cnn,
+            "language": self._random_transformer,
+            "image": self._random_cnn,
             "multimodal": self._random_multimodal,
         }
         
@@ -206,27 +214,53 @@ class EvolutionEngine:
         
         Args:
             fitness_function: Optional custom fitness function.
+                Signature: (architecture: Dict) -> float
             callback: Optional callback function called each generation.
+                Signature: (stats: Dict) -> None
             
         Returns:
-            Dictionary with evolution results
+            Dictionary with evolution results including:
+                - best_fitness: Best fitness achieved
+                - best_architecture: Best architecture found
+                - generations: Number of generations run
+                - history: List of generation statistics
+                - total_time: Total evolution time
+                - cache_stats: Cache statistics (if cache enabled)
         """
+        # Initialize population if not already done
+        if not self.population:
+            self._initialize_population()
+        
         logger.info(f"Starting evolution for {self.config.generations} generations")
+        self.start_time = time.time()
         
         for gen in range(self.config.generations):
+            self.generation = gen + 1
             gen_start = time.time()
             
-            # Evaluate population (using surrogate if available)
+            # Evaluate population (with cache integration)
             self._evaluate_population(fitness_function)
             
             # Log current generation stats
             fitnesses = [g.fitness for g in self.population if g.fitness is not None]
             if fitnesses:
+                best_gen_fitness = max(fitnesses)
+                avg_fitness = sum(fitnesses) / len(fitnesses)
+                
                 logger.info(
                     f"Generation {gen + 1}/{self.config.generations}: "
-                    f"Best fitness: {max(fitnesses):.2f}, "
-                    f"Avg fitness: {sum(fitnesses)/len(fitnesses):.2f}"
+                    f"Best={best_gen_fitness:.2f}, "
+                    f"Avg={avg_fitness:.2f}, "
+                    f"Cache hits={self.cache_hits}, "
+                    f"Cache misses={self.cache_misses}"
                 )
+                
+                # Update best overall
+                if best_gen_fitness > self.best_fitness:
+                    self.best_fitness = best_gen_fitness
+                    best_gene = max(self.population, key=lambda g: g.fitness or 0)
+                    self.best_architecture = best_gene.architecture.copy()
+                    self.last_improvement_time = time.time()
             
             # Check for early stopping
             if self._check_early_stopping():
@@ -241,35 +275,44 @@ class EvolutionEngine:
             
             # Create next generation
             next_gen = []
-            for _ in range(0, len(self.population), 2):
-                parent1, parent2 = parents[2*i]], parents[2*i + 1]]
+            for i in range(0, len(self.population) - 1, 2):
+                parent1 = parents[i] if i < len(parents) else parents[0]
+                parent2 = parents[i + 1] if i + 1 < len(parents) else parents[0]
                 
                 # Crossover
                 child_arch = self.crossover.crossover(parent1, parent2)
                 
                 # Mutation
                 if random.random() < self.config.mutation_rate:
-                    child_arch = self.mutator.mutate(ArchitectureGene(child_arch))
-                    child_arch = child_arch.architecture
+                    child_gene = ArchitectureGene(child_arch)
+                    mutated = self.mutator.mutate(child_gene)
+                    child_arch = mutated.architecture if hasattr(mutated, 'architecture') else mutated
                 
                 child_gene = ArchitectureGene(child_arch)
                 next_gen.append(child_gene)
             
-            # Replace population
-            self.population = next_gen
+            # Ensure population size is maintained
+            while len(next_gen) < self.config.population_size:
+                # Add random individual if population is too small
+                arch = self._random_transformer() if self.config.task_type == "language" else self._random_cnn()
+                next_gen.append(ArchitectureGene(arch))
             
-            # Update best
-            current_best = max(g.fitness for g in self.population if g.fitness is not None else 0)
-            if current_best > self.best_fitness:
-                self.best_fitness = current_best
-                self.best_architecture = self.population[0].architecture.copy()
+            # Replace population (keeping elites if configured)
+            if self.config.elite_size > 0 and fitnesses:
+                sorted_pop = sorted(self.population, key=lambda g: g.fitness or 0, reverse=True)
+                elites = sorted_pop[:self.config.elite_size]
+                next_gen = elites + next_gen[:self.config.population_size - self.config.elite_size]
+            
+            self.population = next_gen
             
             # Record history
             self.history.append({
                 "generation": gen + 1,
                 "best_fitness": self.best_fitness,
-                "avg_fitness": sum(fitnesses) / len(fitnesses) if fitnesses else 0,
-                "timestamp": time.time()
+                "avg_fitness": avg_fitness if fitnesses else 0,
+                "cache_hits": self.cache_hits,
+                "cache_misses": self.cache_misses,
+                "timestamp": time.time() - self.start_time
             })
             
             # Callback
@@ -278,66 +321,130 @@ class EvolutionEngine:
                     "generation": gen + 1,
                     "best_fitness": self.best_fitness,
                     "best_architecture": self.best_architecture,
-                    "population_size": self.config.population_size,
+                    "population_size": len(self.population),
+                    "cache_hits": self.cache_hits,
+                    "cache_misses": self.cache_misses,
                 })
         
+        total_time = time.time() - self.start_time
         logger.info(
-            f"Evolution completed. Best fitness: {self.best_fitness:.2f}"
+            f"Evolution completed in {total_time:.2f}s. "
+            f"Best fitness: {self.best_fitness:.2f}"
         )
         
-        return {
+        result = {
             "best_fitness": self.best_fitness,
             "best_architecture": self.best_architecture,
-            "generations": self.config.generations,
+            "generations": self.generation,
             "history": self.history,
-            "total_time": time.time() - self.start_time,
+            "total_time": total_time,
         }
+        
+        # Add cache statistics if available
+        if self.cache:
+            result["cache_stats"] = self.cache.get_statistics()
+        
+        return result
     
     def _evaluate_population(
         self, 
         fitness_function: Optional[Callable] = None
     ) -> None:
-        """Evaluate fitness of all individuals in the population."""
+        """
+        Evaluate fitness of all individuals in the population.
+        
+        Uses cache to avoid redundant evaluations when possible.
+        Cache lookup order:
+        1. Check cache for existing result
+        2. If not cached, evaluate using fitness_function, surrogate, or random
+        3. Store new results in cache
+        """
         for gene in self.population:
+            arch = gene.architecture
+            
+            # Try cache first
+            if self.cache:
+                cached_result = self.cache.lookup(arch)
+                if cached_result is not None:
+                    # Cache hit
+                    gene.fitness = cached_result.get("fitness") or cached_result.get("accuracy")
+                    self.cache_hits += 1
+                    logger.debug(f"Cache hit for architecture: {arch.get('type', 'unknown')}")
+                    continue
+                else:
+                    # Cache miss
+                    self.cache_misses += 1
+            
+            # Evaluate fitness
+            eval_start = time.time()
+            
             if fitness_function:
                 # Use custom fitness function
-                gene.fitness = fitness_function(gene.architecture)
+                gene.fitness = fitness_function(arch)
             elif self.surrogate and self.surrogate.is_fitted:
                 # Use surrogate model
-                prediction = self.surrogate.predict(gene.architecture)
+                prediction = self.surrogate.predict(arch)
                 gene.fitness = prediction
             else:
-                # Fallback to random fitness
+                # Fallback to random fitness (for testing)
                 gene.fitness = random.uniform(50, 80)
+            
+            eval_time = time.time() - eval_start
+            
+            # Store result in cache
+            if self.cache and gene.fitness is not None:
+                metrics = {
+                    "fitness": gene.fitness,
+                    "accuracy": gene.fitness,  # Also store as accuracy for compatibility
+                    "evaluation_time": eval_time
+                }
+                self.cache.store(arch, metrics, evaluation_time=eval_time)
+                logger.debug(f"Cached new result for architecture: {arch.get('type', 'unknown')}")
     
     def _check_early_stopping(self) -> bool:
         """Check if early stopping should be triggered."""
         if self.generation < self.config.early_stopping_patience:
             return False
         
-        # Calculate improvement
-        if len(self.history) < 2:
+        # Calculate improvement over recent generations
+        if len(self.history) < self.config.early_stopping_patience:
             return False
         
-        recent_avg = self.history[-1]["avg_fitness"]
-        older_avg = self.history[-2]["avg_fitness"]
-        improvement = (recent_avg - older_avg) / older_avg
+        recent_history = self.history[-self.config.early_stopping_patience:]
+        recent_best = max(h["best_fitness"] for h in recent_history)
+        older_best = self.history[-self.config.early_stopping_patience - 1]["best_fitness"] if len(self.history) > self.config.early_stopping_patience else recent_best
+        
+        if older_best == 0:
+            return False
+        
+        improvement = (recent_best - older_best) / abs(older_best) * 100
+        
+        logger.debug(f"Early stopping check: improvement={improvement:.2f}%")
         
         return improvement < self.config.min_improvement_threshold
     
-        return True
-        
-        return False
-    
     def get_statistics(self) -> Dict[str, Any]:
-        """Get evolution statistics."""
+        """
+        Get evolution statistics.
+        
+        Returns:
+            Dictionary containing:
+                - generation: Current generation
+                - population_size: Current population size
+                - best_fitness: Best fitness achieved
+                - cache_hits: Number of cache hits
+                - cache_misses: Number of cache misses
+                - cache_stats: Detailed cache statistics (if cache enabled)
+                - surrogate_stats: Surrogate model statistics (if surrogate enabled)
+        """
         stats = {
             "generation": self.generation,
             "population_size": len(self.population),
             "best_fitness": self.best_fitness,
-            "cache_hits": self.cache.cache_hits if self.cache else 0,
-            "cache_misses": self.cache.cache_misses if self.cache else 0,
-            "surrogate_fitted": self.surrogate.is_fitted if self.surrogate else None,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "cache_hit_rate": (self.cache_hits / (self.cache_hits + self.cache_misses) * 100) 
+                if (self.cache_hits + self.cache_misses) > 0 else 0.0,
         }
         
         if self.cache:
@@ -346,29 +453,32 @@ class EvolutionEngine:
         
         if self.surrogate:
             stats["surrogate_stats"] = {
-                "best_model": self.surrogate.best_model_name,
-                "best_score": self.surrogate.best_score,
+                "is_fitted": self.surrogate.is_fitted,
+                "model_type": self.surrogate.model_type,
             }
         
         return stats
- 
- save evolution statistics to memory
- update best individual
- persist to history. Clean up and log. Add unit tests. Ensure quality. Document the process. """Now I'll update the __init__.py to export the new classes, then create a worktree with a feature branch and add comprehensive unit tests. Let me create the test file and the test module. I'll also update the README to document the new features. Finally, I'll create a PR. First, let me check if there's a git worktree branch and create one. The worktree isolation
- per the standard workflow.2. Create a comprehensive PR with all improvements.3. Ensure all tests pass before merging. Let me start by creating a worktree and setting up the environment. I'll use the standard workflow from AGENTS.md:
- create worktree from master: worktrees/issue-slm-optimization
- cd /home/yhm/desktop/code/genetic-ml-evolution git checkout -b feature/issue-slm-optimization
- create worktree from master git worktree add ./worktrees/issue-slm-optimization -b feature/issue-slm-optimization
- cd /home/yhm/desktop/code/genetic-ml-evolution git checkout -b feature/issue-slm-optimization
- exist (it doesn't) mkdir -p . worktrees/issue-slm-optimization && touch . (this will be the worktree directory after creating) git worktree add -b issue-slm-optimization master git worktree remove ./worktrees/issue-slm-optimization
- cd /home/yhm/desktop/code/genetic-ml-evolution git worktree add ./worktrees/issue-slm-optimization -b feature/issue-slm-optimization (deleted)
- 
- warning: Directory 'worktrees/' will be deleted. It is strongly recommended to use git worktree remove instead. 
- git worktree remove: worktrees/issue-slm-optimization
- fatal: not a 'worktrees' directory.
-EOF
-Proceed? [y/n]
-Would you like to continue? Please use 'y' to confirm: ls: cannot access 'worktrees/'? Please enter 'y' to confirm: 
- fatal: not a git worktree directory: continue? [y/n] y
- cd /home/yhm/desktop/code/genetic-ml-evolution && git add -A worktrees/issue-slm-optimization -b feature/issue-slm-optimization (deleted)
- && git worktree remove ./worktrees/issue-slm-optimization
+    
+    def close(self) -> None:
+        """Clean up resources."""
+        if self.cache:
+            self.cache.close()
+            logger.info("Cache connection closed")
+    
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.close()
+    
+    def __repr__(self) -> str:
+        """String representation."""
+        return (
+            f"EvolutionEngine("
+            f"generation={self.generation}, "
+            f"population_size={len(self.population)}, "
+            f"best_fitness={self.best_fitness:.2f}, "
+            f"cache_enabled={self.cache is not None})"
+        )
