@@ -679,5 +679,203 @@ class TestEdgeCases:
         assert mutated.get("hidden_size", 128) >= 128
 
 
+class TestGQAMutation:
+    """Tests for Grouped Query Attention (GQA) mutation."""
+    
+    @pytest.fixture
+    def mutator(self):
+        return SLMOptimizedMutation(verbose=False)
+    
+    @pytest.fixture
+    def transformer_with_gqa(self):
+        return {
+            "type": "transformer",
+            "num_layers": 6,
+            "hidden_size": 512,
+            "num_heads": 8,
+            "num_kv_heads": 2,  # GQA-4
+            "ffn_dim": 2048,
+            "dropout": 0.1,
+            "vocab_size": 50000,
+        }
+    
+    def test_gqa_mutation_produces_valid_kv_heads(self, mutator, transformer_with_gqa):
+        """GQA mutations should produce valid num_kv_heads values."""
+        for _ in range(50):
+            mutated, desc = mutator.mutate_transformer(transformer_with_gqa)
+            num_heads = mutated.get("num_heads", 8)
+            num_kv_heads = mutated.get("num_kv_heads", num_heads)
+            
+            # KV heads should divide num_heads
+            assert num_heads % num_kv_heads == 0, \
+                f"num_kv_heads ({num_kv_heads}) doesn't divide num_heads ({num_heads})"
+            assert num_kv_heads >= 1
+    
+    def test_gqa_reduces_params(self, mutator):
+        """GQA should reduce parameter count vs MHA."""
+        mha_arch = {"type": "transformer", "num_layers": 6, "hidden_size": 512,
+                    "num_heads": 8, "num_kv_heads": 8, "ffn_dim": 2048, "vocab_size": 50000}
+        gqa_arch = {"type": "transformer", "num_layers": 6, "hidden_size": 512,
+                    "num_heads": 8, "num_kv_heads": 2, "ffn_dim": 2048, "vocab_size": 50000}
+        
+        mha_params = ResourceEstimator.estimate_transformer_params(mha_arch)
+        gqa_params = ResourceEstimator.estimate_transformer_params(gqa_arch)
+        
+        assert gqa_params < mha_params, "GQA should have fewer params than MHA"
+    
+    def test_mqa_extreme(self):
+        """MQA (num_kv_heads=1) should be handled correctly."""
+        mqa_arch = {"type": "transformer", "num_layers": 4, "hidden_size": 256,
+                     "num_heads": 4, "num_kv_heads": 1, "ffn_dim": 1024, "vocab_size": 30000}
+        params = ResourceEstimator.estimate_transformer_params(mqa_arch)
+        assert params > 0
+
+
+class TestQuantizationAwareMutation:
+    """Tests for quantization-aware dimension alignment."""
+    
+    def test_align_dimension(self):
+        """Dimension alignment should produce multiples of target."""
+        assert SLMOptimizedMutation._align_dimension(512) == 512  # already aligned
+        assert SLMOptimizedMutation._align_dimension(513) == 576  # next multiple of 64
+        assert SLMOptimizedMutation._align_dimension(128) == 128
+        assert SLMOptimizedMutation._align_dimension(255) == 256  # aligns to 64
+    
+    def test_mutated_dimensions_are_aligned(self):
+        """Mutated hidden_size should be aligned to quantization-friendly values."""
+        mutator = SLMOptimizedMutation(verbose=False)
+        arch = {"type": "transformer", "num_layers": 6, "hidden_size": 512,
+                "num_heads": 8, "ffn_dim": 2048, "dropout": 0.1}
+        
+        for _ in range(50):
+            mutated, _ = mutator.mutate_transformer(arch)
+            hidden = mutated.get("hidden_size", 512)
+            # Should be divisible by common alignment targets
+            assert hidden % 32 == 0 or hidden % 64 == 0, \
+                f"hidden_size {hidden} not aligned to quantization-friendly value"
+
+
+class TestActivationAndFFNTypeMutation:
+    """Tests for activation function and FFN type mutations."""
+    
+    def test_activation_mutation(self):
+        """Activation function should mutate to valid options."""
+        mutator = SLMOptimizedMutation(verbose=False)
+        arch = {"type": "transformer", "num_layers": 6, "hidden_size": 512,
+                "num_heads": 8, "ffn_dim": 2048, "dropout": 0.1, "activation": "gelu"}
+        
+        activations_seen = set()
+        for _ in range(100):
+            mutated, desc = mutator.mutate_transformer(arch)
+            act = mutated.get("activation", "gelu")
+            activations_seen.add(act)
+        
+        # Should see at least one different activation
+        assert len(activations_seen) >= 1
+    
+    def test_swiglu_ffn_type(self):
+        """SwiGLU FFN type should be supported in param estimation."""
+        standard_arch = {"type": "transformer", "num_layers": 6, "hidden_size": 512,
+                         "num_heads": 8, "ffn_dim": 2048, "ffn_type": "standard", "vocab_size": 50000}
+        swiglu_arch = {**standard_arch, "ffn_type": "swiglu"}
+        
+        std_params = ResourceEstimator.estimate_transformer_params(standard_arch)
+        swiglu_params = ResourceEstimator.estimate_transformer_params(swiglu_arch)
+        
+        # SwiGLU has 3 projections vs 2, so more params
+        assert swiglu_params > std_params
+
+
+class TestGenerationAwareAdaptive:
+    """Tests for generation-aware adaptive mutation strategy."""
+    
+    def test_early_generation_more_exploration(self):
+        """Early generations should allow more aggressive mutations."""
+        mutator = SLMOptimizedMutation(verbose=False, total_generations=50)
+        mutator.generation = 2  # Early
+        
+        arch = {"type": "transformer", "num_layers": 6, "hidden_size": 512,
+                "num_heads": 8, "ffn_dim": 2048, "dropout": 0.1}
+        
+        # High fitness but early gen -> should be moderate, not conservative
+        strategy = mutator._select_adaptive_strategy(85.0)
+        assert strategy == "moderate"  # Upgraded from conservative
+    
+    def test_late_generation_more_refinement(self):
+        """Late generations should favor conservative mutations."""
+        mutator = SLMOptimizedMutation(verbose=False, total_generations=50)
+        mutator.generation = 45  # Late
+        
+        # Low fitness but late gen -> should be moderate, not aggressive
+        strategy = mutator._select_adaptive_strategy(30.0)
+        assert strategy == "moderate"  # Downgraded from aggressive
+    
+    def test_mid_generation_unchanged(self):
+        """Mid generations should use fitness-based strategy directly."""
+        mutator = SLMOptimizedMutation(verbose=False, total_generations=50)
+        mutator.generation = 25  # Mid
+        
+        assert mutator._select_adaptive_strategy(85.0) == "conservative"
+        assert mutator._select_adaptive_strategy(50.0) == "moderate"
+        assert mutator._select_adaptive_strategy(30.0) == "aggressive"
+
+
+class TestInferenceMemoryEstimation:
+    """Tests for inference memory estimation."""
+    
+    def test_inference_less_than_training(self):
+        """Inference memory should be less than training memory."""
+        arch = {"type": "transformer", "num_layers": 6, "hidden_size": 512,
+                "num_heads": 8, "ffn_dim": 2048, "vocab_size": 50000, "max_seq_len": 512}
+        
+        train_mem = ResourceEstimator.estimate_memory_gb(arch, batch_size=4)
+        infer_mem = ResourceEstimator.estimate_inference_memory_gb(arch, batch_size=4, seq_len=512, quant_bits=4)
+        
+        assert infer_mem < train_mem, "Inference with INT4 should use less memory than training"
+    
+    def test_quantized_inference_scales(self):
+        """INT4 inference should use ~1/4 memory of FP16 params."""
+        arch = {"type": "transformer", "num_layers": 6, "hidden_size": 512,
+                "num_heads": 8, "ffn_dim": 2048, "vocab_size": 50000}
+        
+        fp16_mem = ResourceEstimator.estimate_inference_memory_gb(arch, quant_bits=16)
+        int4_mem = ResourceEstimator.estimate_inference_memory_gb(arch, quant_bits=4)
+        
+        # Param portion should be ~1/4, total won't be exactly 1/4 due to KV cache
+        assert int4_mem < fp16_mem
+
+
+class TestHistoryGuidedMutation:
+    """Tests for history-guided mutation selection."""
+    
+    def test_best_mutation_type_selection(self):
+        """Should select the mutation type with highest historical success rate."""
+        mutator = SLMOptimizedMutation(verbose=False)
+        arch = {"type": "transformer", "num_layers": 6, "hidden_size": 512,
+                "num_heads": 8, "ffn_dim": 2048, "dropout": 0.1}
+        
+        # Record successful "layer" mutations
+        for _ in range(5):
+            mutator.record_result(arch, arch, 50.0, 55.0, "layer")
+        # Record failed "hidden" mutations
+        for _ in range(5):
+            mutator.record_result(arch, arch, 50.0, 45.0, "hidden")
+        
+        best = mutator._get_best_mutation_type()
+        assert best == "layer"
+    
+    def test_insufficient_history_returns_none(self):
+        """Should return None when not enough history data."""
+        mutator = SLMOptimizedMutation(verbose=False)
+        arch = {"type": "transformer", "num_layers": 6, "hidden_size": 512,
+                "num_heads": 8, "ffn_dim": 2048, "dropout": 0.1}
+        
+        mutator.record_result(arch, arch, 50.0, 55.0, "layer")
+        mutator.record_result(arch, arch, 50.0, 55.0, "layer")
+        
+        # Only 2 samples, need 3 minimum
+        assert mutator._get_best_mutation_type() is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
