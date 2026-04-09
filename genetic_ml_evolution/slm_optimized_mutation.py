@@ -73,57 +73,102 @@ class ResourceEstimator:
     
     @staticmethod
     def estimate_transformer_params(arch: Dict[str, Any]) -> int:
-        """估算 Transformer 参数量"""
+        """估算 Transformer 参数量，支持 GQA 和 RoPE 等现代 SLM 技术"""
         vocab_size = arch.get("vocab_size", 50000)
         num_layers = arch.get("num_layers", 6)
         hidden_size = arch.get("hidden_size", 512)
         num_heads = arch.get("num_heads", 8)
         ffn_dim = arch.get("ffn_dim", 2048)
         max_seq_len = arch.get("max_seq_len", 512)
+        num_kv_heads = arch.get("num_kv_heads", num_heads)  # GQA support
         
         # Embedding: vocab_size * hidden_size
         embedding_params = vocab_size * hidden_size
         
-        # Each transformer layer:
-        # - Self-attention: 4 * hidden_size^2 (Q, K, V, O projections)
-        # - FFN: 2 * hidden_size * ffn_dim
-        # - Layer norms: 2 * hidden_size (per layer)
-        attention_params_per_layer = 4 * hidden_size * hidden_size
-        ffn_params_per_layer = 2 * hidden_size * ffn_dim
+        # Self-attention with GQA support:
+        # - Q projection: hidden_size * hidden_size
+        # - K projection: hidden_size * (hidden_size / num_heads * num_kv_heads)
+        # - V projection: same as K
+        # - O projection: hidden_size * hidden_size
+        head_dim = hidden_size // num_heads
+        kv_dim = head_dim * num_kv_heads
+        attention_params_per_layer = (hidden_size * hidden_size  # Q
+                                      + 2 * hidden_size * kv_dim  # K, V
+                                      + hidden_size * hidden_size)  # O
+        
+        # FFN: support SwiGLU (3 projections) vs standard (2 projections)
+        ffn_type = arch.get("ffn_type", "standard")
+        if ffn_type == "swiglu":
+            # SwiGLU: gate_proj + up_proj + down_proj = 3 * hidden_size * ffn_dim
+            ffn_params_per_layer = 3 * hidden_size * ffn_dim
+        else:
+            ffn_params_per_layer = 2 * hidden_size * ffn_dim
+        
         layernorm_params_per_layer = 2 * hidden_size
         
         layer_params = (attention_params_per_layer + ffn_params_per_layer + layernorm_params_per_layer) * num_layers
         
         # Output layer (usually tied with embeddings)
-        output_params = 0  # Tied with embeddings
+        output_params = 0
         
         total_params = embedding_params + layer_params + output_params
         
         return total_params
     
     @staticmethod
-    def estimate_memory_gb(arch: Dict[str, Any], batch_size: int = 32) -> float:
-        """估算显存需求（GB）"""
+    def estimate_memory_gb(arch: Dict[str, Any], batch_size: int = 32, quant_bits: int = 16) -> float:
+        """估算显存需求（GB），支持训练/推理和量化"""
         num_layers = arch.get("num_layers", 6)
         hidden_size = arch.get("hidden_size", 512)
         max_seq_len = arch.get("max_seq_len", 512)
+        num_kv_heads = arch.get("num_kv_heads", arch.get("num_heads", 8))
+        num_heads = arch.get("num_heads", 8)
         
-        # 粗略估计
-        # Parameters: ~4 bytes per param
-        param_memory = ResourceEstimator.estimate_transformer_params(arch) * 4 / (1024**3)
+        bytes_per_param = quant_bits // 8
+        total_params = ResourceEstimator.estimate_transformer_params(arch)
         
-        # Activations: batch_size * seq_len * hidden_size * num_layers * 4 bytes
-        activation_memory = batch_size * max_seq_len * hidden_size * num_layers * 4 / (1024**3)
+        # Parameters
+        param_memory = total_params * bytes_per_param / (1024**3)
         
-        # Gradients (same as params)
+        # Activations: more accurate with GQA (KV cache smaller)
+        head_dim = hidden_size // num_heads
+        # Q/V activations: batch * seq * hidden * layers * 2 (input + output)
+        # K/V activations: batch * seq * head_dim * num_kv_heads * layers * 2
+        activation_memory = (
+            batch_size * max_seq_len * hidden_size * num_layers * 2  # Q, V
+            + batch_size * max_seq_len * head_dim * num_kv_heads * num_layers * 2  # K, V (GQA)
+        ) * 4 / (1024**3)
+        
+        # KV Cache for inference (not needed during training but useful for SLM)
+        kv_cache_per_layer = 2 * num_kv_heads * head_dim * max_seq_len * 2  # K + V, fp16
+        kv_cache_total = kv_cache_per_layer * num_layers * batch_size / (1024**3)
+        
+        # For training: gradients + optimizer
         gradient_memory = param_memory
+        optimizer_memory = param_memory * 2  # Adam states
         
-        # Optimizer states (2x params for Adam)
-        optimizer_memory = param_memory * 2
-        
+        # Training mode: params + activations + gradients + optimizer
+        # Inference mode: params + KV cache
         total_memory = param_memory + activation_memory + gradient_memory + optimizer_memory
         
         return total_memory
+    
+    @staticmethod
+    def estimate_inference_memory_gb(arch: Dict[str, Any], batch_size: int = 1, seq_len: int = 512, quant_bits: int = 4) -> float:
+        """估算推理显存需求（GB），考虑量化"""
+        total_params = ResourceEstimator.estimate_transformer_params(arch)
+        bytes_per_param = quant_bits // 8
+        param_memory = total_params * bytes_per_param / (1024**3)
+        
+        num_layers = arch.get("num_layers", 6)
+        num_heads = arch.get("num_heads", 8)
+        num_kv_heads = arch.get("num_kv_heads", num_heads)
+        head_dim = arch.get("hidden_size", 512) // num_heads
+        
+        # KV Cache: batch * seq * num_layers * num_kv_heads * head_dim * 2 (K+V) * 2 bytes (fp16)
+        kv_cache = batch_size * seq_len * num_layers * num_kv_heads * head_dim * 2 * 2 / (1024**3)
+        
+        return param_memory + kv_cache
 
 
 class SemanticAnalyzer:
@@ -278,13 +323,15 @@ class SLMOptimizedMutation:
         max_memory_gb: float = 20.0,  # 20GB 显存上限
         enable_semantic_analysis: bool = True,
         enable_history_learning: bool = True,
-        verbose: bool = False
+        verbose: bool = False,
+        total_generations: int = 50,  # 总代数（用于自适应衰减）
     ):
         self.max_params = max_params
         self.max_memory_gb = max_memory_gb
         self.enable_semantic_analysis = enable_semantic_analysis
         self.enable_history_learning = enable_history_learning
         self.verbose = verbose
+        self.total_generations = total_generations
         
         # 工具类
         self.resource_estimator = ResourceEstimator()
@@ -293,6 +340,9 @@ class SLMOptimizedMutation:
         # 统计和历史
         self.statistics = MutationStatistics()
         self.generation = 0
+        
+        # SLM 专用的维度对齐策略（量化友好）
+        self._alignment_multiples = [64, 32]  # 优先对齐到 64 的倍数
     
     def mutate(
         self,
@@ -371,13 +421,61 @@ class SLMOptimizedMutation:
             return mutated, "no_change"
     
     def _select_adaptive_strategy(self, fitness: float) -> str:
-        """根据适应度选择变异策略"""
+        """根据适应度和进化阶段选择变异策略（代数衰减）"""
+        # 计算进化进度 (0.0 ~ 1.0)
+        progress = min(1.0, self.generation / max(1, self.total_generations))
+        
+        # 基于适应度的基础策略
         if fitness >= 80:
-            return "conservative"  # 高性能：微调
+            base_strategy = "conservative"
         elif fitness >= 50:
-            return "moderate"  # 中等：适度探索
+            base_strategy = "moderate"
         else:
-            return "aggressive"  # 低性能：大改
+            base_strategy = "aggressive"
+        
+        # 进化后期自动趋向保守（精炼阶段）
+        if progress > 0.7:
+            # 后 30% 代数：降低探索，增加利用
+            if base_strategy == "aggressive":
+                return "moderate"
+            elif base_strategy == "moderate":
+                return "conservative"
+        elif progress < 0.2:
+            # 前 20% 代数：鼓励探索
+            if base_strategy == "conservative":
+                return "moderate"
+        
+        return base_strategy
+    
+    @staticmethod
+    def _align_dimension(value: int, multiples: List[int] = None) -> int:
+        """将维度对齐到量化友好的倍数，优先最小倍数"""
+        if multiples is None:
+            multiples = [64, 32]
+        for m in multiples:
+            if value % m == 0:
+                return value
+        # 对齐到第一个倍数
+        return (value // multiples[0] + 1) * multiples[0]
+    
+    def _get_best_mutation_type(self) -> Optional[str]:
+        """基于历史数据选择成功率最高的变异类型"""
+        if not self.enable_history_learning:
+            return None
+        
+        best_type = None
+        best_rate = 0.0
+        min_samples = 3  # 至少 3 次样本才信任统计
+        
+        for mutation_type, stats in self.statistics.by_type.items():
+            total = stats["success"] + stats["failure"]
+            if total >= min_samples:
+                rate = stats["success"] / total
+                if rate > best_rate:
+                    best_rate = rate
+                    best_type = mutation_type
+        
+        return best_type
     
     def _generate_mutation_candidates(
         self,
@@ -416,7 +514,7 @@ class SLMOptimizedMutation:
                 base_candidate["num_layers"] = new_layers
                 mutations.append(f"layers:{old_layers}→{new_layers}")
         
-        # 2. 隐藏维度变异
+        # 2. 隐藏维度变异（量化友好对齐）
         if random.random() < mutation_rate:
             old_hidden = arch.get("hidden_size", 512)
             delta = random.choice(hidden_delta_range)
@@ -426,11 +524,14 @@ class SLMOptimizedMutation:
             num_heads = base_candidate.get("num_heads", 8)
             new_hidden = (new_hidden // num_heads) * num_heads
             
+            # 量化友好对齐
+            new_hidden = self._align_dimension(new_hidden, self._alignment_multiples)
+            
             if new_hidden != old_hidden:
                 base_candidate["hidden_size"] = new_hidden
                 mutations.append(f"hidden:{old_hidden}→{new_hidden}")
                 
-                # 3. 同步调整 FFN dim（保持比例）
+                # 3. 同步调整 FFN dim（保持比例，量化友好）
                 old_ffn = arch.get("ffn_dim", 2048)
                 ffn_ratio = old_ffn / old_hidden if old_hidden > 0 else 3.0
                 
@@ -441,6 +542,8 @@ class SLMOptimizedMutation:
                 
                 new_ffn = int(new_hidden * ffn_ratio)
                 new_ffn = max(256, min(3072, new_ffn))
+                # 量化友好对齐
+                new_ffn = self._align_dimension(new_ffn, [256, 128])
                 base_candidate["ffn_dim"] = new_ffn
                 mutations.append(f"ffn:{old_ffn}→{new_ffn}")
         
@@ -489,7 +592,73 @@ class SLMOptimizedMutation:
                 base_candidate["dropout"] = new_dropout
                 mutations.append(f"dropout:{old_dropout:.2f}→{new_dropout:.2f}")
         
-        # 6. 基于语义分析的优化变异
+        # 6. GQA (Grouped Query Attention) 变异 - SLM 关键优化
+        if random.random() < mutation_rate:
+            old_kv_heads = arch.get("num_kv_heads", arch.get("num_heads", 8))
+            num_heads = base_candidate.get("num_heads", 8)
+            hidden_size = base_candidate.get("hidden_size", 512)
+            head_dim = hidden_size // num_heads
+            
+            # GQA: num_kv_heads 可以是 num_heads 的 1/N (N=1,2,4,8)
+            # 常见配置: MHA (kv_heads=heads), GQA-4 (kv_heads=heads/4), MQA (kv_heads=1)
+            gqa_ratios = [1, 2, 4, 8]  # num_heads / num_kv_heads
+            valid_kv_heads = []
+            for ratio in gqa_ratios:
+                kv_h = num_heads // ratio
+                if kv_h >= 1 and num_heads % ratio == 0:
+                    valid_kv_heads.append(kv_h)
+            
+            # 倾向于更少的 KV heads（更高效的 SLM）
+            if len(valid_kv_heads) > 1 and random.random() < 0.6:
+                # 60% 概率减少 KV heads
+                current_idx = valid_kv_heads.index(old_kv_heads) if old_kv_heads in valid_kv_heads else 0
+                new_idx = min(current_idx + 1, len(valid_kv_heads) - 1)
+                new_kv_heads = valid_kv_heads[new_idx]
+            elif valid_kv_heads:
+                new_kv_heads = random.choice(valid_kv_heads)
+            else:
+                new_kv_heads = old_kv_heads
+            
+            if new_kv_heads != old_kv_heads and new_kv_heads != num_heads:
+                base_candidate["num_kv_heads"] = new_kv_heads
+                gqa_type = "MQA" if new_kv_heads == 1 else f"GQA-{num_heads // new_kv_heads}"
+                mutations.append(f"kv_heads:{old_kv_heads}→{new_kv_heads}({gqa_type})")
+            elif new_kv_heads == num_heads and old_kv_heads != num_heads:
+                # 回退到 MHA
+                base_candidate["num_kv_heads"] = num_heads
+                mutations.append(f"kv_heads:{old_kv_heads}→{num_heads}(MHA)")
+        
+        # 7. Activation function 变异
+        if random.random() < mutation_rate * 0.5:  # 较低频率
+            old_activation = arch.get("activation", "gelu")
+            activations = ["gelu", "silu", "relu", "gelu_new"]
+            # SLM 偏好 SiLU (Swish) 和 GELU
+            slm_preferred = ["silu", "gelu"]
+            if random.random() < 0.7:
+                new_activation = random.choice(slm_preferred)
+            else:
+                new_activation = random.choice([a for a in activations if a != old_activation])
+            
+            if new_activation != old_activation:
+                base_candidate["activation"] = new_activation
+                mutations.append(f"activation:{old_activation}→{new_activation}")
+        
+        # 8. FFN type 变异 (standard vs SwiGLU)
+        if random.random() < mutation_rate * 0.3:
+            old_ffn_type = arch.get("ffn_type", "standard")
+            ffn_types = ["standard", "swiglu"]
+            # SLM 偏好 SwiGLU (LLaMA-style)
+            new_ffn_type = "swiglu" if old_ffn_type == "standard" else "standard"
+            if new_ffn_type != old_ffn_type:
+                base_candidate["ffn_type"] = new_ffn_type
+                # SwiGLU 使用 8/3 ≈ 2.67x 而非 4x
+                if new_ffn_type == "swiglu":
+                    hidden = base_candidate.get("hidden_size", 512)
+                    new_ffn = self._align_dimension(int(hidden * 8 / 3), [256, 128])
+                    base_candidate["ffn_dim"] = new_ffn
+                mutations.append(f"ffn_type:{old_ffn_type}→{new_ffn_type}")
+        
+        # 9. 基于语义分析的优化变异
         if semantic_analysis and semantic_analysis.get("issues"):
             # 应用建议的改进
             suggestions = self.semantic_analyzer.suggest_improvements(arch, semantic_analysis)
@@ -622,49 +791,54 @@ class SLMOptimizedMutation:
         candidates: List[Tuple[Dict[str, Any], str]],
         semantic_analysis: Optional[Dict[str, Any]] = None
     ) -> Optional[Tuple[Dict[str, Any], str]]:
-        """选择最佳的变异候选"""
+        """选择最佳的变异候选（结合历史成功率和 GQA 效率）"""
         if not candidates:
             return None
-        
-        # 如果只有一个候选，直接返回
         if len(candidates) == 1:
             return candidates[0]
         
-        # 评分候选
+        best_history_type = self._get_best_mutation_type()
+        
         scored_candidates = []
         for arch, desc in candidates:
             score = 0.0
             
-            # 1. 资源效率评分（使用更少资源更好）
+            # 1. 资源效率评分
             params = self.resource_estimator.estimate_transformer_params(arch)
-            memory = self.resource_estimator.estimate_memory_gb(arch)
-            
-            # 资源效率 = 1 - (params / max_params)
             resource_score = 1.0 - (params / self.max_params)
-            score += resource_score * 20  # 权重 20
+            score += resource_score * 20
             
             # 2. 语义平衡评分
             if semantic_analysis:
                 analysis = self.semantic_analyzer.analyze_transformer_semantics(arch)
                 balance_score = analysis.get("balance_score", 50) / 100.0
-                score += balance_score * 30  # 权重 30
+                score += balance_score * 30
             
-            # 3. 变异幅度评分（适度变异更好）
+            # 3. 变异幅度评分
             mutation_count = desc.count("→")
             if mutation_count == 1:
-                score += 10  # 单个变异
+                score += 10
             elif mutation_count == 2:
-                score += 15  # 两个变异（协同）
+                score += 15
             elif mutation_count <= 4:
-                score += 5   # 多个变异
+                score += 5
             else:
-                score -= 10  # 过多变异
+                score -= 10
+            
+            # 4. 历史引导评分
+            if best_history_type and best_history_type in desc:
+                score += 15
+            
+            # 5. GQA/MQA 效率加分
+            num_heads = arch.get("num_heads", 8)
+            num_kv_heads = arch.get("num_kv_heads", num_heads)
+            if num_kv_heads < num_heads:
+                gqa_ratio = num_heads / num_kv_heads
+                score += min(10, gqa_ratio * 3)
             
             scored_candidates.append((score, arch, desc))
         
-        # 选择得分最高的
         scored_candidates.sort(reverse=True, key=lambda x: x[0])
-        
         return (scored_candidates[0][1], scored_candidates[0][2])
     
     def mutate_cnn(
