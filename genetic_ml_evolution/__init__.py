@@ -14,6 +14,9 @@ from .slm_optimized_mutation import (
     SLMOptimizedMutation,
     ResourceEstimator,
     SemanticAnalyzer,
+    MutationStrategy as SLMMutationStrategy,
+    QuantizationMode,
+    AttentionType,
     create_slm_mutation_operator,
 )
 
@@ -26,5 +29,8 @@ __all__ = [
     "SLMOptimizedMutation",
     "ResourceEstimator",
     "SemanticAnalyzer",
+    "SLMMutationStrategy",
+    "QuantizationMode",
+    "AttentionType",
     "create_slm_mutation_operator",
 ]
