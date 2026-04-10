@@ -11,16 +11,50 @@ Key Features:
 3. Resource-Aware Mutation - Respect computational budget
 4. Performance-Adaptive Mutation - Adjust strategy based on fitness
 5. History-Guided Mutation - Learn from past successes/failures
+6. Progressive Scheduling - Dynamic mutation across generations
+7. PEFT-Aware Mutation - LoRA/QLoRA-friendly architecture mutations
+8. GQA Support - Grouped Query Attention in mutation space
+9. Quantization-Aware - Consider 4bit/8bit quantization constraints
+10. Multi-Objective Scoring - Balance accuracy, params, and latency
 """
 
 import random
 import copy
+import math
 from typing import Dict, Any, List, Optional, Tuple, Callable
 from dataclasses import dataclass, field
 import logging
 from collections import defaultdict
+from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+
+class MutationStrategy(Enum):
+    """变异策略枚举"""
+    CONSERVATIVE = "conservative"
+    MODERATE = "moderate"
+    AGGRESSIVE = "aggressive"
+    PROGRESSIVE_EARLY = "progressive_early"
+    PROGRESSIVE_MID = "progressive_mid"
+    PROGRESSIVE_LATE = "progressive_late"
+    PEFT_FOCUSED = "peft_focused"
+    QUANT_AWARE = "quant_aware"
+
+
+class QuantizationMode(Enum):
+    """量化模式"""
+    NONE = "none"
+    INT8 = "int8"
+    INT4 = "int4"
+    MIXED = "mixed"
+
+
+class AttentionType(Enum):
+    """注意力类型"""
+    MHA = "mha"
+    GQA = "gqa"
+    MQA = "mqa"
 
 
 @dataclass
@@ -46,6 +80,9 @@ class MutationStatistics:
     # 按变异类型统计
     by_type: Dict[str, Dict[str, int]] = field(default_factory=lambda: defaultdict(lambda: {"success": 0, "failure": 0}))
     
+    # 按代统计（用于 progressive scheduling）
+    by_generation: Dict[int, Dict[str, Any]] = field(default_factory=lambda: defaultdict(lambda: {"count": 0, "avg_improvement": 0.0}))
+    
     def record_mutation(self, record: MutationRecord):
         """记录一次变异"""
         self.total_mutations += 1
@@ -57,6 +94,14 @@ class MutationStatistics:
         else:
             self.failed_mutations += 1
             self.by_type[record.mutation_type]["failure"] += 1
+        
+        # 更新代统计
+        gen_stats = self.by_generation[record.generation]
+        gen_stats["count"] += 1
+        n = gen_stats["count"]
+        gen_stats["avg_improvement"] = (
+            (gen_stats["avg_improvement"] * (n - 1) + record.improvement) / n
+        )
     
     def get_success_rate(self, mutation_type: Optional[str] = None) -> float:
         """获取变异成功率"""
@@ -66,64 +111,99 @@ class MutationStatistics:
             return stats["success"] / total if total > 0 else 0.0
         else:
             return self.successful_mutations / self.total_mutations if self.total_mutations > 0 else 0.0
+    
+    def get_recent_trend(self, window: int = 5) -> float:
+        """获取最近 window 代的平均改进趋势"""
+        if not self.mutation_history:
+            return 0.0
+        recent = [r for r in self.mutation_history[-window * 10:]]
+        if not recent:
+            return 0.0
+        return sum(r.improvement for r in recent) / len(recent)
 
 
 class ResourceEstimator:
-    """资源估算器"""
+    """资源估算器 - 支持 GQA 和量化感知估算"""
     
     @staticmethod
     def estimate_transformer_params(arch: Dict[str, Any]) -> int:
-        """估算 Transformer 参数量"""
+        """估算 Transformer 参数量（支持 GQA 和 SwiGLU）"""
         vocab_size = arch.get("vocab_size", 50000)
         num_layers = arch.get("num_layers", 6)
         hidden_size = arch.get("hidden_size", 512)
         num_heads = arch.get("num_heads", 8)
         ffn_dim = arch.get("ffn_dim", 2048)
-        max_seq_len = arch.get("max_seq_len", 512)
+        num_kv_heads = arch.get("num_kv_heads", num_heads)  # GQA support
         
-        # Embedding: vocab_size * hidden_size
+        # Embedding
         embedding_params = vocab_size * hidden_size
         
-        # Each transformer layer:
-        # - Self-attention: 4 * hidden_size^2 (Q, K, V, O projections)
-        # - FFN: 2 * hidden_size * ffn_dim
-        # - Layer norms: 2 * hidden_size (per layer)
-        attention_params_per_layer = 4 * hidden_size * hidden_size
-        ffn_params_per_layer = 2 * hidden_size * ffn_dim
-        layernorm_params_per_layer = 2 * hidden_size
+        # Attention with GQA awareness
+        head_dim = hidden_size // num_heads
+        attention_params_per_layer = (
+            hidden_size * hidden_size +                      # Q
+            hidden_size * head_dim * num_kv_heads +          # K
+            hidden_size * head_dim * num_kv_heads +          # V
+            hidden_size * hidden_size                        # O
+        )
         
+        # FFN with SwiGLU support
+        activation = arch.get("activation", "gelu")
+        if activation in ("swiglu", "silu"):
+            ffn_params_per_layer = 3 * hidden_size * ffn_dim
+        else:
+            ffn_params_per_layer = 2 * hidden_size * ffn_dim
+        
+        layernorm_params_per_layer = 2 * hidden_size
         layer_params = (attention_params_per_layer + ffn_params_per_layer + layernorm_params_per_layer) * num_layers
         
-        # Output layer (usually tied with embeddings)
-        output_params = 0  # Tied with embeddings
-        
-        total_params = embedding_params + layer_params + output_params
-        
-        return total_params
+        return embedding_params + layer_params
     
     @staticmethod
     def estimate_memory_gb(arch: Dict[str, Any], batch_size: int = 32) -> float:
-        """估算显存需求（GB）"""
+        """估算显存需求（GB）- 支持量化和 PEFT"""
         num_layers = arch.get("num_layers", 6)
         hidden_size = arch.get("hidden_size", 512)
         max_seq_len = arch.get("max_seq_len", 512)
         
-        # 粗略估计
-        # Parameters: ~4 bytes per param
-        param_memory = ResourceEstimator.estimate_transformer_params(arch) * 4 / (1024**3)
+        total_params = ResourceEstimator.estimate_transformer_params(arch)
         
-        # Activations: batch_size * seq_len * hidden_size * num_layers * 4 bytes
+        # Quantization reduces parameter memory
+        quant_mode = arch.get("quantization", "none")
+        bytes_per_param = {"int4": 0.5, "int8": 1.0}.get(quant_mode, 4.0)
+        
+        # PEFT mode reduces trainable parameters
+        peft_mode = arch.get("peft_mode", "none")
+        if peft_mode in ("lora", "qlora"):
+            lora_rank = arch.get("lora_rank", 8 if peft_mode == "lora" else 16)
+            trainable_ratio = min((2 * hidden_size * lora_rank * num_layers) / total_params, 0.1)
+        else:
+            trainable_ratio = 1.0
+        
+        param_memory = total_params * bytes_per_param / (1024**3)
+        trainable_memory = total_params * trainable_ratio * 4 / (1024**3)
         activation_memory = batch_size * max_seq_len * hidden_size * num_layers * 4 / (1024**3)
+        gradient_memory = trainable_memory
+        optimizer_memory = trainable_memory * 2
         
-        # Gradients (same as params)
-        gradient_memory = param_memory
+        return param_memory + trainable_memory + activation_memory + gradient_memory + optimizer_memory
+    
+    @staticmethod
+    def estimate_latency_ms(arch: Dict[str, Any], seq_len: int = 128) -> float:
+        """估算推理延迟（ms）- 用于多目标优化"""
+        num_layers = arch.get("num_layers", 6)
+        hidden_size = arch.get("hidden_size", 512)
+        num_heads = arch.get("num_heads", 8)
+        ffn_dim = arch.get("ffn_dim", 2048)
+        num_kv_heads = arch.get("num_kv_heads", num_heads)
         
-        # Optimizer states (2x params for Adam)
-        optimizer_memory = param_memory * 2
+        head_dim = hidden_size // num_heads
+        attn_flops = 2 * seq_len * (hidden_size * head_dim + hidden_size * head_dim * num_kv_heads + hidden_size * hidden_size)
+        ffn_flops = 2 * seq_len * 2 * hidden_size * ffn_dim
+        total_flops_per_token = num_layers * (attn_flops + ffn_flops)
+        latency_per_token = total_flops_per_token / 10e12 * 1000  # ms @ 10 TFLOPS
         
-        total_memory = param_memory + activation_memory + gradient_memory + optimizer_memory
-        
-        return total_memory
+        return max(1.0, min(latency_per_token * seq_len, 10000.0))
 
 
 class SemanticAnalyzer:
@@ -270,20 +350,37 @@ class SLMOptimizedMutation:
     3. 资源感知变异 - 考虑计算预算
     4. 性能自适应变异 - 根据适应度调整策略
     5. 历史引导变异 - 学习成功模式
+    6. 渐进式调度 - 跨代动态调整变异强度
+    7. PEFT 感知 - LoRA/QLoRA 友好的架构变异
+    8. GQA 支持 - 在变异空间中探索分组查询注意力
+    9. 量化感知 - 考虑 4bit/8bit 量化约束
+    10. 多目标评分 - 平衡精度、参数量和延迟
     """
     
     def __init__(
         self,
         max_params: int = 100_000_000,  # 100M 参数上限
         max_memory_gb: float = 20.0,  # 20GB 显存上限
+        max_latency_ms: float = 500.0,  # 500ms 推理延迟上限
         enable_semantic_analysis: bool = True,
         enable_history_learning: bool = True,
+        enable_gqa: bool = True,  # 启用 GQA 变异
+        enable_peft_mutation: bool = True,  # 启用 PEFT 模式变异
+        enable_quant_aware: bool = True,  # 启用量化感知
+        enable_progressive: bool = True,  # 启用渐进式调度
+        total_generations: int = 50,  # 总代数（用于渐进式调度）
         verbose: bool = False
     ):
         self.max_params = max_params
         self.max_memory_gb = max_memory_gb
+        self.max_latency_ms = max_latency_ms
         self.enable_semantic_analysis = enable_semantic_analysis
         self.enable_history_learning = enable_history_learning
+        self.enable_gqa = enable_gqa
+        self.enable_peft_mutation = enable_peft_mutation
+        self.enable_quant_aware = enable_quant_aware
+        self.enable_progressive = enable_progressive
+        self.total_generations = total_generations
         self.verbose = verbose
         
         # 工具类
@@ -371,13 +468,20 @@ class SLMOptimizedMutation:
             return mutated, "no_change"
     
     def _select_adaptive_strategy(self, fitness: float) -> str:
-        """根据适应度选择变异策略"""
+        """根据适应度和进化阶段选择变异策略"""
+        # 先检查渐进式调度
+        progressive = self._get_progressive_strategy()
+        
+        # 结合适应度和阶段
         if fitness >= 80:
-            return "conservative"  # 高性能：微调
+            # 高性能：以渐进式为主，偏向保守
+            return "conservative" if progressive != "aggressive" else "moderate"
         elif fitness >= 50:
-            return "moderate"  # 中等：适度探索
+            # 中等：跟随渐进式
+            return progressive
         else:
-            return "aggressive"  # 低性能：大改
+            # 低性能：适度激进
+            return progressive if progressive == "aggressive" else "moderate"
     
     def _generate_mutation_candidates(
         self,
@@ -491,15 +595,22 @@ class SLMOptimizedMutation:
         
         # 6. 基于语义分析的优化变异
         if semantic_analysis and semantic_analysis.get("issues"):
-            # 应用建议的改进
             suggestions = self.semantic_analyzer.suggest_improvements(arch, semantic_analysis)
-            
-            for suggestion in suggestions[:1]:  # 只应用最高优先级的建议
+            for suggestion in suggestions[:1]:
                 if suggestion["priority"] == "high" and random.random() < 0.5:
                     if suggestion["type"] == "adjust_ffn":
                         old_ffn = base_candidate.get("ffn_dim", 2048)
                         base_candidate["ffn_dim"] = suggestion["target_value"]
                         mutations.append(f"ffn_optimized:{old_ffn}→{suggestion['target_value']}")
+        
+        # 7. GQA 变异（分组查询注意力）
+        mutations.extend(self._mutate_gqa(base_candidate))
+        
+        # 8. PEFT 配置变异
+        mutations.extend(self._mutate_peft_config(base_candidate))
+        
+        # 9. 量化配置变异
+        mutations.extend(self._mutate_quantization(base_candidate))
         
         if mutations:
             candidates.append((base_candidate, "; ".join(mutations)))
@@ -581,18 +692,147 @@ class SLMOptimizedMutation:
         else:
             return None
     
+    def _get_progressive_strategy(self) -> str:
+        """根据进化阶段返回渐进式策略"""
+        if not self.enable_progressive or self.total_generations <= 0:
+            return "moderate"
+        progress = self.generation / self.total_generations
+        if progress < 0.2:
+            return "aggressive"
+        elif progress < 0.5:
+            return "moderate"
+        else:
+            return "conservative"
+    
+    def _mutate_gqa(self, arch: Dict[str, Any]) -> List[str]:
+        """
+        GQA (Grouped Query Attention) 变异
+        
+        在 num_heads 和 num_kv_heads 之间建立有意义的变异关系。
+        GQA 用较少的 KV heads 减少 KV cache 内存，同时保持模型质量。
+        """
+        mutations = []
+        if not self.enable_gqa:
+            return mutations
+        
+        num_heads = arch.get("num_heads", 8)
+        num_kv_heads = arch.get("num_kv_heads", num_heads)
+        hidden_size = arch.get("hidden_size", 512)
+        
+        valid_kv_heads = [h for h in range(1, num_heads + 1) if num_heads % h == 0]
+        if not valid_kv_heads:
+            return mutations
+        
+        if random.random() < 0.3:
+            preferred_kv = [h for h in valid_kv_heads if 2 <= num_heads // h <= 8]
+            new_kv = random.choice(preferred_kv) if preferred_kv else random.choice(valid_kv_heads)
+            
+            if new_kv != num_kv_heads:
+                arch["num_kv_heads"] = new_kv
+                if new_kv == 1:
+                    arch["attention_type"] = "mqa"
+                elif new_kv < num_heads:
+                    arch["attention_type"] = "gqa"
+                else:
+                    arch["attention_type"] = "mha"
+                mutations.append(f"kv_heads:{num_kv_heads}→{new_kv}({arch['attention_type']})")
+        
+        return mutations
+    
+    def _mutate_peft_config(self, arch: Dict[str, Any]) -> List[str]:
+        """
+        PEFT (Parameter-Efficient Fine-Tuning) 配置变异
+        
+        探索 LoRA/QLoRA 的 rank、alpha 和 target_modules。
+        """
+        mutations = []
+        if not self.enable_peft_mutation:
+            return mutations
+        
+        if random.random() < 0.2:
+            current_mode = arch.get("peft_mode", "none")
+            modes = ["none", "lora", "qlora"]
+            other_modes = [m for m in modes if m != current_mode]
+            new_mode = random.choice(other_modes)
+            arch["peft_mode"] = new_mode
+            mutations.append(f"peft_mode:{current_mode}→{new_mode}")
+            
+            if new_mode == "lora" and "lora_rank" not in arch:
+                arch["lora_rank"] = 8
+                arch["lora_alpha"] = 16
+            elif new_mode == "qlora" and "lora_rank" not in arch:
+                arch["lora_rank"] = 16
+                arch["lora_alpha"] = 32
+                arch["quantization"] = "int4"
+        
+        if arch.get("peft_mode") in ("lora", "qlora") and random.random() < 0.3:
+            valid_ranks = [4, 8, 16, 32, 64]
+            old_rank = arch.get("lora_rank", 8)
+            new_rank = random.choice(valid_ranks)
+            if new_rank != old_rank:
+                arch["lora_rank"] = new_rank
+                arch["lora_alpha"] = random.choice([new_rank, int(new_rank * 1.5), new_rank * 2])
+                mutations.append(f"lora_rank:{old_rank}→{new_rank}(alpha={arch['lora_alpha']})")
+        
+        return mutations
+    
+    def _mutate_quantization(self, arch: Dict[str, Any]) -> List[str]:
+        """量化配置变异"""
+        mutations = []
+        if not self.enable_quant_aware:
+            return mutations
+        
+        if random.random() < 0.15:
+            current_quant = arch.get("quantization", "none")
+            quant_options = ["none", "int8", "int4"]
+            other_options = [q for q in quant_options if q != current_quant]
+            new_quant = random.choice(other_options)
+            
+            if arch.get("peft_mode") == "qlora":
+                new_quant = "int4"
+            
+            if new_quant != current_quant:
+                arch["quantization"] = new_quant
+                mutations.append(f"quantization:{current_quant}→{new_quant}")
+        
+        return mutations
+    
+    def _multi_objective_score(self, arch: Dict[str, Any], fitness: Optional[float] = None) -> float:
+        """多目标评分：平衡精度、参数量和延迟"""
+        params = self.resource_estimator.estimate_transformer_params(arch)
+        memory = self.resource_estimator.estimate_memory_gb(arch)
+        latency = self.resource_estimator.estimate_latency_ms(arch)
+        
+        param_score = max(0.0, 1.0 - params / self.max_params)
+        memory_score = max(0.0, 1.0 - memory / self.max_memory_gb)
+        latency_score = max(0.0, 1.0 - latency / self.max_latency_ms)
+        efficiency = 0.4 * param_score + 0.3 * memory_score + 0.3 * latency_score
+        
+        if fitness is not None:
+            accuracy_score = min(fitness / 100.0, 1.0)
+            return 0.6 * accuracy_score + 0.4 * efficiency
+        
+        return efficiency
+    
     def _conservative_mutate_transformer(self, arch: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
-        """保守变异：最小化改动"""
+        """保守变异：最小化改动（支持 GQA/PEFT/量化）"""
         mutated = copy.deepcopy(arch)
         mutations = []
         
-        # 只做非常小的调整
+        # Dropout 微调
         if random.random() < 0.3:
             old_dropout = mutated.get("dropout", 0.1)
             delta = random.uniform(-0.02, 0.02)
             new_dropout = max(0.05, min(0.25, old_dropout + delta))
             mutated["dropout"] = round(new_dropout, 2)
-            mutations.append(f"dropout:{old_dropout:.2f}→{new_dropout:.2f}")
+            if new_dropout != old_dropout:
+                mutations.append(f"dropout:{old_dropout:.2f}→{new_dropout:.2f}")
+        
+        # GQA 微调
+        mutations.extend(self._mutate_gqa(mutated))
+        
+        # 量化微调
+        mutations.extend(self._mutate_quantization(mutated))
         
         if mutations:
             return mutated, "conservative:" + "; ".join(mutations)
@@ -600,19 +840,17 @@ class SLMOptimizedMutation:
             return mutated, "no_change"
     
     def _is_within_budget(self, arch: Dict[str, Any]) -> bool:
-        """检查架构是否在资源预算内"""
-        # 检查参数量
+        """检查架构是否在资源预算内（参数量、显存、延迟）"""
         param_count = self.resource_estimator.estimate_transformer_params(arch)
         if param_count > self.max_params:
-            if self.verbose:
-                logger.debug(f"Architecture exceeds param budget: {param_count / 1e6:.2f}M > {self.max_params / 1e6:.2f}M")
             return False
         
-        # 检查显存
         memory_gb = self.resource_estimator.estimate_memory_gb(arch)
         if memory_gb > self.max_memory_gb:
-            if self.verbose:
-                logger.debug(f"Architecture exceeds memory budget: {memory_gb:.2f}GB > {self.max_memory_gb:.2f}GB")
+            return False
+        
+        latency_ms = self.resource_estimator.estimate_latency_ms(arch)
+        if latency_ms > self.max_latency_ms:
             return False
         
         return True
@@ -620,51 +858,38 @@ class SLMOptimizedMutation:
     def _select_best_mutation(
         self,
         candidates: List[Tuple[Dict[str, Any], str]],
-        semantic_analysis: Optional[Dict[str, Any]] = None
+        semantic_analysis: Optional[Dict[str, Any]] = None,
+        fitness: Optional[float] = None
     ) -> Optional[Tuple[Dict[str, Any], str]]:
-        """选择最佳的变异候选"""
+        """选择最佳的变异候选（使用多目标评分）"""
         if not candidates:
             return None
-        
-        # 如果只有一个候选，直接返回
         if len(candidates) == 1:
             return candidates[0]
         
-        # 评分候选
         scored_candidates = []
         for arch, desc in candidates:
-            score = 0.0
+            # 使用多目标评分
+            score = self._multi_objective_score(arch, fitness) * 100
             
-            # 1. 资源效率评分（使用更少资源更好）
-            params = self.resource_estimator.estimate_transformer_params(arch)
-            memory = self.resource_estimator.estimate_memory_gb(arch)
-            
-            # 资源效率 = 1 - (params / max_params)
-            resource_score = 1.0 - (params / self.max_params)
-            score += resource_score * 20  # 权重 20
-            
-            # 2. 语义平衡评分
+            # 语义平衡加分
             if semantic_analysis:
                 analysis = self.semantic_analyzer.analyze_transformer_semantics(arch)
                 balance_score = analysis.get("balance_score", 50) / 100.0
-                score += balance_score * 30  # 权重 30
+                score += balance_score * 10
             
-            # 3. 变异幅度评分（适度变异更好）
+            # 变异幅度评分（适度变异更好）
             mutation_count = desc.count("→")
-            if mutation_count == 1:
-                score += 10  # 单个变异
-            elif mutation_count == 2:
-                score += 15  # 两个变异（协同）
+            if mutation_count == 2:
+                score += 3
             elif mutation_count <= 4:
-                score += 5   # 多个变异
-            else:
-                score -= 10  # 过多变异
+                score += 1
+            elif mutation_count > 6:
+                score -= 5
             
             scored_candidates.append((score, arch, desc))
         
-        # 选择得分最高的
         scored_candidates.sort(reverse=True, key=lambda x: x[0])
-        
         return (scored_candidates[0][1], scored_candidates[0][2])
     
     def mutate_cnn(
